@@ -1,6 +1,7 @@
 # Git
 .git
 .gitignore
+secrets/
 
 # Python bytecode & cache
 __pycache__/

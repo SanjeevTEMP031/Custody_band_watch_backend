@@ -21,6 +21,26 @@ from ..utils.logger import app_logger
 router = APIRouter(prefix="/gps", tags=["GPS & Locations"])
 
 
+def _first_non_none(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
+def _coordinate_source(
+    location: Dict[str, Any], gps_valid: bool, has_last_known: bool
+) -> Any:
+    if has_last_known:
+        return "last_known"
+    source = str(
+        location.get("coordinate_source")
+        or location.get("location_source")
+        or location.get("gps_source")
+        or ""
+    ).strip().lower()
+    if source in {"lbs", "cell", "cellular", "network", "indoor_lbs"} or source.endswith("_lbs"):
+        return "lbs"
+    return "gps" if gps_valid else None
+
+
 @router.post("/ingest", response_model=Dict[str, Any])
 @router.post("/ingest/", response_model=Dict[str, Any], include_in_schema=False)
 @router.put("/ingest", response_model=Dict[str, Any], include_in_schema=False)
@@ -256,9 +276,14 @@ def get_live_locations():
         lat = location["latitude"] if gps_valid else None
         lon = location["longitude"] if gps_valid else None
         name = d.get("wearer_name") or d.get("name") or "Wearer"
-        bearing_val = d.get("heading") or d.get("bearing") or d.get("course") or d.get("direction") or 0.0
-        speed_val = d.get("speed") or d.get("speed_kmh") or 0.0
-        batt_val = d.get("battery")
+        motion = location if gps_valid else (last_known_location or {})
+        bearing_val = _first_non_none(
+            motion.get("heading"), motion.get("bearing"), motion.get("course"), 0.0
+        )
+        speed_val = _first_non_none(
+            motion.get("speed_kmh"), motion.get("speed"), 0.0
+        )
+        batt_val = d.get("battery") if d.get("battery") is not None else d.get("battery_percent")
         is_chg = bool(d.get("is_charging") or d.get("charging") or False)
         gps_status = (
             location.get("gps_status", d.get("gps_status", "No Fix"))
@@ -295,9 +320,12 @@ def get_live_locations():
             "gps_valid": gps_valid,
             "gps_fix": gps_valid,
             "gps_locked": gps_valid,
-            "coordinate_source": "live" if gps_valid else None,
+            "coordinate_source": _coordinate_source(
+                location or {}, gps_valid, not gps_valid and last_known_location is not None
+            ),
             "location_is_current": gps_valid,
             "last_known_location": last_known_location,
+            "latest": d.get("latest") or {},
             "last_seen": d.get("last_seen"),
             "last_packet_received": d.get("last_packet_received") or d.get("last_seen"),
             "tcp_connected": bool(d.get("tcp_connected", False)),
@@ -334,14 +362,20 @@ def get_latest_location(device_id: str):
             detail=f"Device '{device_id}' not found"
         )
 
-    latest_telemetry = firestore_service.get_latest_valid_telemetry(device_id) or {}
     location = firestore_service.get_latest_valid_location(device_id, dev)
-    bearing_val = dev.get("heading") or dev.get("bearing") or dev.get("course") or latest_telemetry.get("heading") or 0.0
-    speed_val = latest_telemetry.get("speed_kmh") or dev.get("speed") or 0.0
-    batt_val = dev.get("battery")
+    batt_val = (
+        dev.get("battery") if dev.get("battery") is not None else dev.get("battery_percent")
+    )
     is_chg = bool(dev.get("is_charging") or dev.get("charging") or False)
     gps_valid = bool(location and location.get("gps_valid", False))
     last_known_location = firestore_service.get_last_known_location(dev)
+    motion = location if gps_valid else (last_known_location or {})
+    bearing_val = _first_non_none(
+        motion.get("heading"), motion.get("bearing"), motion.get("course"), 0.0
+    )
+    speed_val = _first_non_none(
+        motion.get("speed_kmh"), motion.get("speed"), 0.0
+    )
     lat = (
         location["latitude"] if gps_valid
         else last_known_location.get("latitude") if last_known_location else None
@@ -356,8 +390,8 @@ def get_latest_location(device_id: str):
         and lat is not None
         and lon is not None
     )
-    coordinate_source = "live" if gps_valid else (
-        "last_known" if has_last_known_coordinates else None
+    coordinate_source = _coordinate_source(
+        location or {}, gps_valid, has_last_known_coordinates
     )
     gps_status = (
         location.get("gps_status", dev.get("gps_status", "No Fix"))
@@ -408,6 +442,7 @@ def get_latest_location(device_id: str):
             else dev.get("last_valid_gps_time")
         ),
         "last_known_location": last_known_location,
+        "latest": dev.get("latest") or {},
         "gps_source": (
             location.get("gps_source") if gps_valid else None
         ),

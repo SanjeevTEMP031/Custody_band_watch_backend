@@ -315,7 +315,10 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
         shared_time = iso_at(timedelta(seconds=-20))
         global_time = iso_at(timedelta(seconds=-10))
         device_history = MagicMock()
-        device_history.order_by.return_value.limit.return_value.stream.return_value = [
+        device_history_query = MagicMock()
+        device_history.order_by.return_value = device_history_query
+        device_history_query.limit.return_value = device_history_query
+        device_history_query.stream.return_value = [
             FakeSnapshot({
                 "timestamp": shared_time,
                 "gps_valid": True,
@@ -327,7 +330,12 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
         device_collection = MagicMock()
         device_collection.document.return_value.collection.return_value = device_history
         global_telemetry = MagicMock()
-        global_telemetry.where.return_value.stream.return_value = [
+        telemetry_query = MagicMock()
+        global_telemetry.where.return_value = telemetry_query
+        telemetry_query.where.return_value = telemetry_query
+        telemetry_query.order_by.return_value = telemetry_query
+        telemetry_query.limit.return_value = telemetry_query
+        telemetry_query.stream.return_value = [
             FakeSnapshot({
                 "device_id": "FIRESTORE_MERGED_HISTORY_TEST",
                 "timestamp": shared_time,
@@ -345,9 +353,18 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
                 "longitude": 79.1
             }, "global-only-fix")
         ]
+        empty_logs = MagicMock()
+        logs_query = MagicMock()
+        empty_logs.where.return_value = logs_query
+        logs_query.where.return_value = logs_query
+        logs_query.order_by.return_value = logs_query
+        logs_query.limit.return_value = logs_query
+        logs_query.stream.return_value = []
         db = MagicMock()
         db.collection.side_effect = lambda name: (
-            device_collection if name == "devices" else global_telemetry
+            device_collection if name == "devices"
+            else empty_logs if name == "logs"
+            else global_telemetry
         )
 
         with (
@@ -391,14 +408,31 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "longitude": 79.1
         }, "old-valid-fix"))
         device_history = MagicMock()
-        device_history.order_by.return_value.stream.return_value = []
+        device_history_query = MagicMock()
+        device_history.order_by.return_value = device_history_query
+        device_history_query.limit.return_value = device_history_query
+        device_history_query.stream.return_value = []
         device_collection = MagicMock()
         device_collection.document.return_value.collection.return_value = device_history
         global_telemetry = MagicMock()
-        global_telemetry.where.return_value.stream.return_value = remote_records
+        telemetry_query = MagicMock()
+        global_telemetry.where.return_value = telemetry_query
+        telemetry_query.where.return_value = telemetry_query
+        telemetry_query.order_by.return_value = telemetry_query
+        telemetry_query.limit.return_value = telemetry_query
+        telemetry_query.stream.return_value = remote_records
+        empty_logs = MagicMock()
+        logs_query = MagicMock()
+        empty_logs.where.return_value = logs_query
+        logs_query.where.return_value = logs_query
+        logs_query.order_by.return_value = logs_query
+        logs_query.limit.return_value = logs_query
+        logs_query.stream.return_value = []
         db = MagicMock()
         db.collection.side_effect = lambda name: (
-            device_collection if name == "devices" else global_telemetry
+            device_collection if name == "devices"
+            else empty_logs if name == "logs"
+            else global_telemetry
         )
 
         with (
@@ -1051,6 +1085,8 @@ class GPSRouteLocationTests(unittest.TestCase):
             "device_id": "LAST_KNOWN_ROUTE_TEST",
             "gps_status": "No Fix",
             "gps_valid": False,
+            "speed": 0.0,
+            "heading": 0.0,
             "last_fix": {
                 "at": fix_time,
                 "lat": 17.446886,
@@ -1061,6 +1097,11 @@ class GPSRouteLocationTests(unittest.TestCase):
             "latitude": 17.446886,
             "longitude": 78.369267,
             "timestamp": fix_time,
+            "age_seconds": 120,
+            "accuracy_m": 8.5,
+            "speed_kmh": 6.6,
+            "heading": 326.2,
+            "bearing": 326.2,
             "label": "Last known",
             "is_current": False,
             "is_stale": False,
@@ -1079,8 +1120,48 @@ class GPSRouteLocationTests(unittest.TestCase):
         self.assertEqual((latest["latitude"], latest["longitude"]), (17.446886, 78.369267))
         self.assertEqual((latest["lat"], latest["lon"]), (17.446886, 78.369267))
         self.assertEqual(latest["coordinate_source"], "last_known")
+        self.assertEqual(latest["speed_kmh"], 6.6)
+        self.assertEqual(latest["heading"], 326.2)
+        self.assertEqual(latest["last_known_location"]["age_seconds"], 120)
+        self.assertEqual(latest["last_known_location"]["accuracy_m"], 8.5)
         self.assertFalse(latest["location_is_current"])
         self.assertEqual(latest["last_known_location"], last_known)
+
+    def test_last_known_uses_fix_time_and_motion_from_matching_telemetry(self):
+        fix_time = iso_at(timedelta(hours=-2))
+        telemetry = {
+            "device_id": "LAST_KNOWN_FIX_METADATA_TEST",
+            "timestamp": fix_time,
+            "gps_valid": True,
+            "gps_source": "watch_tcp",
+            "latitude": 17.446886,
+            "longitude": 78.369267,
+            "speed_kmh": 6.6,
+            "heading": 326.2,
+            "accuracy_m": 8.5,
+        }
+        device = {
+            "device_id": telemetry["device_id"],
+            "timestamp": iso_at(),
+            "last_valid_gps_time": fix_time,
+            "last_latitude": telemetry["latitude"],
+            "last_longitude": telemetry["longitude"],
+            "gps_valid": False,
+            "gps_source": "watch_tcp",
+            "speed": 0.0,
+            "heading": 0.0,
+        }
+        with patch.object(
+            firestore_service, "get_latest_valid_telemetry", return_value=telemetry
+        ):
+            location = firestore_service.get_last_known_location(device)
+
+        self.assertEqual(location["timestamp"], normalize_iso_timestamp(fix_time))
+        self.assertGreaterEqual(location["age_seconds"], 7200)
+        self.assertEqual(location["accuracy_m"], 8.5)
+        self.assertEqual(location["speed_kmh"], 6.6)
+        self.assertEqual(location["heading"], 326.2)
+        self.assertEqual(location["coordinate_source"], "last_known")
 
     def test_live_route_includes_last_known_location_without_promoting_it_to_live(self):
         device_id = "LAST_KNOWN_LIVE_ROUTE_TEST"
@@ -1387,7 +1468,7 @@ class WatchGpsPersistenceTests(unittest.TestCase):
         self.assertEqual(device["gps_source"], "watch_tcp")
         self.assertEqual(len(history), 2)
 
-    def test_latest_location_rejects_snapshot_without_verified_source(self):
+    def test_latest_location_accepts_writer_snapshot_without_gps_source(self):
         fix_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         location = firestore_service.get_latest_valid_location(
             self.device_id,
@@ -1398,7 +1479,10 @@ class WatchGpsPersistenceTests(unittest.TestCase):
                 "gps_valid": True,
             }
         )
-        self.assertIsNone(location)
+        self.assertIsNotNone(location)
+        self.assertEqual((location["latitude"], location["longitude"]), (17.44, 78.36))
+        self.assertEqual(location["gps_source"], "watch_tcp")
+        self.assertTrue(location["gps_valid"])
 
     def test_invalid_v_packet_preserves_previous_valid_location_and_gps_time(self):
         valid_time = datetime.now(timezone.utc).replace(microsecond=0)

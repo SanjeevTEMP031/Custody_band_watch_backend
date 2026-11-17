@@ -5,7 +5,7 @@ Tracks wearer pulse trends, step counts, and abnormal physiological patterns.
 
 import sqlite3
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from ..services.device_service import device_service
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -71,10 +71,32 @@ class HealthService:
         hr_history = self.get_heart_rate_history(device_id, limit=30)
 
         bpms = [h["bpm"] for h in hr_history if h.get("bpm", 0) > 0]
-        avg_bpm = round(sum(bpms) / len(bpms)) if bpms else (dev.get("heart_rate") or 75)
-        max_bpm = max(bpms) if bpms else avg_bpm
-        min_bpm = min(bpms) if bpms else avg_bpm
-        curr_bpm = dev.get("heart_rate") or (hr_history[0]["bpm"] if hr_history else 75)
+        device_hr = dev.get("heart_rate")
+        curr_bpm: Optional[Any] = (
+            device_hr if device_hr is not None
+            else (hr_history[0]["bpm"] if hr_history else None)
+        )
+        avg_bpm = round(sum(bpms) / len(bpms)) if bpms else curr_bpm
+        max_bpm = max(bpms) if bpms else curr_bpm
+        min_bpm = min(bpms) if bpms else curr_bpm
+
+        battery = dev.get("battery")
+        if battery is None:
+            battery = dev.get("battery_percent")
+
+        blood_pressure = None
+        if hr_history and hr_history[0].get("blood_pressure") not in (None, ""):
+            blood_pressure = hr_history[0].get("blood_pressure")
+        if blood_pressure is None:
+            blood_pressure = dev.get("blood_pressure")
+
+        spo2 = None
+        if hr_history and hr_history[0].get("spo2") is not None:
+            spo2 = hr_history[0].get("spo2")
+        if spo2 is None:
+            spo2 = dev.get("blood_oxygen")
+        if spo2 is None:
+            spo2 = dev.get("spo2")
 
         return {
             "device_id": device_id,
@@ -89,18 +111,25 @@ class HealthService:
             "avg_bpm": avg_bpm,
             "max_bpm": max_bpm,
             "min_bpm": min_bpm,
-            "today_steps": dev.get("steps", 1420),
-            "steps": dev.get("steps", 1420),
-            "battery_percent": dev.get("battery", 94),
-            "battery": dev.get("battery", 94),
+            "today_steps": dev.get("steps"),
+            "steps": dev.get("steps"),
+            "battery_percent": battery,
+            "battery": battery,
             "status": dev.get("status", "ONLINE"),
             "online": dev.get("status", "ONLINE") in ("ONLINE", "ACTIVE"),
-            "blood_pressure": hr_history[0].get("blood_pressure", "120/80") if hr_history else "120/80",
-            "spo2": hr_history[0].get("spo2", 98) if hr_history else 98,
+            "blood_pressure": blood_pressure,
+            "spo2": spo2,
+            "temperature": dev.get("temperature"),
+            "blood_oxygen": spo2,
+            "blood_glucose": dev.get("blood_glucose"),
+            "glucose_mmol_l": dev.get("glucose_mmol_l"),
+            "hrv": dev.get("hrv"),
+            "sleep": dev.get("sleep"),
+            "sleep_report": dev.get("sleep_report"),
+            "sleep_allday": dev.get("sleep_allday"),
             "recent_pulse_readings": hr_history[:10],
             "history": hr_history
         }
 
 
 health_service = HealthService()
-

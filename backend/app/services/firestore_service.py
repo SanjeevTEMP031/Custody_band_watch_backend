@@ -26,11 +26,47 @@ TRUSTED_GPS_SOURCES = frozenset({
     "watch_udp",
     "gps_ingest_api"
 })
+LOG_LOCATION_TYPES = frozenset({
+    "location",
+    "location_on_demand",
+    "sos_alarm"
+})
 GPS_FIX_MAX_AGE_SECONDS = 900
 MAX_FIRESTORE_TELEMETRY_OUTBOX_RECORDS = 50000
 FIRESTORE_OUTBOX_BATCH_SIZE = 4
 FIRESTORE_RETRY_BASE_SECONDS = 2
 FIRESTORE_RETRY_MAX_SECONDS = 300
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _battery_fields(value: Any) -> Dict[str, Any]:
+    return {
+        "battery": value,
+        "batteryLevel": value,
+        "battery_level": value,
+        "battery_pct": value,
+        "battery_percent": value,
+        "battery_percentage": value,
+        "charge": value,
+    }
+
+
+def fix_event_timestamp(fix: Dict[str, Any]) -> Any:
+    """Prefer gps_time, then other known fix-time fields from writer or backend docs."""
+    return _first_present(
+        fix.get("gps_time"),
+        fix.get("timestamp"),
+        fix.get("at"),
+        fix.get("location_time"),
+        fix.get("last_valid_gps_time"),
+        fix.get("received_at"),
+    )
 
 
 def _json_default(value: Any):
@@ -136,6 +172,8 @@ class FirestoreService:
         self._device_firestore_failures: Dict[str, int] = {}
         self._devices_firestore_retry_at = 0.0
         self._devices_firestore_failures = 0
+        self._history_firestore_retry_at: Dict[str, float] = {}
+        self._history_firestore_failures: Dict[str, int] = {}
         self._sync_worker_lock = threading.Lock()
         self._sync_worker_stop = threading.Event()
         self._sync_worker_thread: Optional[threading.Thread] = None
@@ -275,11 +313,7 @@ class FirestoreService:
 
         battery = device.get("battery")
         if battery is not None:
-            sync_doc.update({
-                "battery_percent": battery,
-                "battery_level": battery,
-                "charge": battery,
-            })
+            sync_doc.update(_battery_fields(battery))
         if device.get("is_charging") is not None:
             charging = bool(device.get("is_charging"))
             sync_doc.update({
@@ -529,6 +563,249 @@ class FirestoreService:
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def _latest_section(device: Dict[str, Any], key: str) -> Dict[str, Any]:
+        latest = device.get("latest")
+        if not isinstance(latest, dict):
+            return {}
+        section = latest.get(key)
+        return section if isinstance(section, dict) else {}
+
+    @staticmethod
+    def _location_telemetry_fields(record: Dict[str, Any]) -> Dict[str, Any]:
+        speed = _first_present(record.get("speed_kmh"), record.get("speed"))
+        heading = _first_present(
+            record.get("heading"),
+            record.get("bearing"),
+            record.get("course"),
+            record.get("direction_deg"),
+        )
+        accuracy = _first_present(
+            record.get("accuracy_m"),
+            record.get("horizontal_accuracy_m"),
+            record.get("accuracy"),
+        )
+        try:
+            accuracy = float(accuracy) if accuracy is not None else None
+            if accuracy is not None and (not math.isfinite(accuracy) or accuracy < 0):
+                accuracy = None
+        except (TypeError, ValueError, OverflowError):
+            accuracy = None
+        return {
+            "speed": speed,
+            "speed_kmh": speed,
+            "heading": heading,
+            "bearing": heading,
+            "accuracy_m": accuracy,
+        }
+
+    @classmethod
+    def _device_location_candidates(cls, device: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Root, last_fix, and latest.* location-shaped dicts for enrichment/verification."""
+        latest = device.get("latest") if isinstance(device.get("latest"), dict) else {}
+        candidates: List[Dict[str, Any]] = [
+            {
+                "latitude": _first_present(
+                    device.get("last_latitude"),
+                    device.get("latitude"),
+                    device.get("lat"),
+                ),
+                "longitude": _first_present(
+                    device.get("last_longitude"),
+                    device.get("longitude"),
+                    device.get("lon"),
+                    device.get("lng"),
+                ),
+                "gps_valid": device.get("gps_valid"),
+                "gps_fix": device.get("gps_fix"),
+                "gps_locked": device.get("gps_locked"),
+                "gps_source": device.get("gps_source"),
+                "gps_time": _first_present(
+                    device.get("last_valid_gps_time"), device.get("gps_time")
+                ),
+                "timestamp": device.get("timestamp"),
+                "at": device.get("at"),
+                "location_time": device.get("location_time"),
+                "last_valid_gps_time": device.get("last_valid_gps_time"),
+                "received_at": _first_present(
+                    device.get("received_at"), device.get("last_seen")
+                ),
+                "raw": device.get("raw"),
+            }
+        ]
+        last_fix = device.get("last_fix")
+        if isinstance(last_fix, dict):
+            inherited = dict(last_fix)
+            if inherited.get("gps_valid") is None and inherited.get("gps_fix") is None:
+                inherited["gps_valid"] = device.get("gps_valid")
+                inherited["gps_fix"] = device.get("gps_fix")
+            if inherited.get("gps_source") is None:
+                inherited["gps_source"] = device.get("gps_source")
+            candidates.append(inherited)
+        for key in ("location", "location_on_demand", "sos_alarm"):
+            section = latest.get(key)
+            if isinstance(section, dict):
+                candidates.append(section)
+        return candidates
+
+    @classmethod
+    def _best_verified_device_fix(
+        cls, device_id: str, device: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        best: Optional[Dict[str, Any]] = None
+        for candidate in cls._device_location_candidates(device):
+            verified = cls._normalize_verified_fix(device_id, candidate)
+            if verified is None:
+                continue
+            if best is None or is_newer_timestamp(
+                verified["timestamp"], best.get("timestamp")
+            ):
+                best = verified
+        return best
+
+    @classmethod
+    def _apply_device_vitals(cls, d: Dict[str, Any]) -> None:
+        """Normalize fields written by the watch receiver into device-level aliases."""
+        latest_status = cls._latest_section(d, "status")
+        latest_location = cls._latest_section(d, "location")
+        latest_hr = cls._latest_section(d, "heart_rate")
+        latest_temp = cls._latest_section(d, "temperature")
+        latest_bp = cls._latest_section(d, "blood_pressure")
+        latest_o2 = cls._latest_section(d, "blood_oxygen")
+        latest_glucose = cls._latest_section(d, "blood_glucose")
+        latest_sleep = cls._latest_section(d, "sleep")
+        latest_sleep_report = cls._latest_section(d, "sleep_report")
+        latest_sleep_allday = cls._latest_section(d, "sleep_allday")
+
+        batt = _first_present(
+            d.get("battery_percent"),
+            d.get("battery"),
+            d.get("battery_level"),
+            d.get("battery_pct"),
+            d.get("batteryLevel"),
+            d.get("battery_percentage"),
+            latest_status.get("battery_percent"),
+            latest_location.get("battery_percent"),
+            d.get("charge"),
+        )
+        if batt is not None:
+            try:
+                b_int = int(float(batt))
+                d.update(_battery_fields(b_int))
+                d["battery_status"] = "normal" if b_int > 20 else "low"
+            except (ValueError, TypeError):
+                pass
+        else:
+            d.update(_battery_fields(None))
+            d.pop("battery_status", None)
+
+        steps = _first_present(
+            d.get("steps"),
+            latest_status.get("steps"),
+            latest_location.get("steps"),
+        )
+        if steps is not None:
+            try:
+                d["steps"] = int(float(steps))
+            except (ValueError, TypeError):
+                d["steps"] = None
+        else:
+            d["steps"] = None
+
+        heart_rate = _first_present(
+            d.get("heart_rate"),
+            latest_hr.get("heart_rate_bpm"),
+        )
+        if heart_rate is not None:
+            try:
+                d["heart_rate"] = int(float(heart_rate))
+            except (ValueError, TypeError):
+                d["heart_rate"] = None
+        else:
+            d["heart_rate"] = None
+        hrv = _first_present(d.get("hrv"), latest_hr.get("hrv"))
+        if hrv is not None:
+            d["hrv"] = hrv
+
+        temperature = _first_present(
+            d.get("temperature"),
+            latest_temp.get("temperature_c"),
+        )
+        if temperature is not None:
+            d["temperature"] = temperature
+            d["temperature_c"] = temperature
+
+        blood_pressure = d.get("blood_pressure")
+        if blood_pressure is None:
+            systolic = latest_bp.get("systolic")
+            diastolic = latest_bp.get("diastolic")
+            if systolic is not None and diastolic is not None:
+                blood_pressure = f"{systolic}/{diastolic}"
+                d["systolic"] = systolic
+                d["diastolic"] = diastolic
+            elif latest_bp:
+                blood_pressure = latest_bp
+        if blood_pressure is not None:
+            d["blood_pressure"] = blood_pressure
+
+        blood_oxygen = _first_present(
+            d.get("blood_oxygen"),
+            d.get("spo2"),
+            latest_o2.get("spo2_percent"),
+        )
+        if blood_oxygen is not None:
+            d["blood_oxygen"] = blood_oxygen
+            d["spo2"] = blood_oxygen
+            d["spo2_percent"] = blood_oxygen
+
+        glucose = _first_present(
+            d.get("blood_glucose"),
+            d.get("glucose_mmol_l"),
+            latest_glucose.get("glucose_mmol_l"),
+        )
+        if glucose is not None:
+            d["blood_glucose"] = glucose
+            d["glucose_mmol_l"] = glucose
+
+        sleep = d.get("sleep")
+        if sleep is None and latest_sleep:
+            sleep = latest_sleep
+        if sleep:
+            d["sleep"] = sleep
+        for field, section in (
+            ("sleep_report", latest_sleep_report),
+            ("sleep_allday", latest_sleep_allday),
+        ):
+            if section:
+                d[field] = section
+
+        latest_status_fields = ("mileage_km",)
+        latest_location_fields = (
+            "altitude_m",
+            "satellites",
+            "signal_percent",
+            "steps",
+            "rolls",
+            "alarms",
+            "cell_mcc",
+            "cell_mnc",
+            "cells",
+            "wifi",
+            "nearby_wifi_count",
+            "speed_kmh",
+            "direction_deg",
+        )
+        for field in latest_status_fields:
+            value = _first_present(d.get(field), latest_status.get(field))
+            if value is not None:
+                d[field] = value
+        for field in latest_location_fields:
+            value = _first_present(d.get(field), latest_location.get(field))
+            if value is not None:
+                d[field] = value
+        if d.get("signal_percent") is not None:
+            d["gsm_signal"] = d["signal_percent"]
+
     def _enrich_device_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
         """Calculates dynamic status, online state, and GPS status for a device."""
         now_dt = datetime.now(timezone.utc)
@@ -549,9 +826,29 @@ class FirestoreService:
         d["status"] = "ONLINE" if is_online else "OFFLINE"
         d["last_packet_received"] = last_seen
 
-        # Coordinates
-        lat = d.get("last_latitude") if d.get("last_latitude") is not None else d.get("latitude")
-        lon = d.get("last_longitude") if d.get("last_longitude") is not None else d.get("longitude")
+        verified = self._best_verified_device_fix(dev_id, d)
+        lat = None
+        lon = None
+        if verified is not None:
+            lat = verified["latitude"]
+            lon = verified["longitude"]
+            if not d.get("last_valid_gps_time"):
+                d["last_valid_gps_time"] = verified["timestamp"]
+            if not d.get("gps_source"):
+                d["gps_source"] = verified["gps_source"]
+        else:
+            for candidate in self._device_location_candidates(d):
+                position = valid_coordinate_pair(
+                    candidate.get("latitude", candidate.get("lat")),
+                    candidate.get(
+                        "longitude",
+                        candidate.get("lon", candidate.get("lng")),
+                    ),
+                )
+                if position is not None:
+                    lat, lon = position
+                    break
+
         d["last_latitude"] = lat
         d["last_longitude"] = lon
         d["latitude"] = lat
@@ -561,8 +858,10 @@ class FirestoreService:
         d["lng"] = lon
 
         # GPS status is independent of packet/connection status.
-        is_gps_valid = is_gps_valid_flag(d.get("gps_valid"))
         last_valid_gps_time = d.get("last_valid_gps_time")
+        if last_valid_gps_time is None and verified is not None:
+            last_valid_gps_time = verified["timestamp"]
+            d["last_valid_gps_time"] = last_valid_gps_time
         fix_dt = parse_iso_timestamp(last_valid_gps_time)
         fix_age = (
             (now_dt - fix_dt).total_seconds()
@@ -570,38 +869,27 @@ class FirestoreService:
         )
         has_position = valid_coordinate_pair(lat, lon) is not None
         current_fix = (
-            is_gps_valid
+            verified is not None
             and has_position
             and fix_age is not None
             and 0 <= fix_age <= GPS_FIX_MAX_AGE_SECONDS
         )
         if current_fix:
             gps_status = "GPS Locked"
-        elif has_position and fix_age is not None and fix_age > GPS_FIX_MAX_AGE_SECONDS:
+        elif has_position and (
+            (fix_age is not None and fix_age > GPS_FIX_MAX_AGE_SECONDS)
+            or verified is not None
+        ):
             gps_status = "Location Stale"
         else:
             gps_status = "No Fix"
-        is_gps_valid = current_fix
 
-        d["gps_valid"] = is_gps_valid
-        d["gps_fix"] = is_gps_valid
-        d["gps_locked"] = is_gps_valid
+        d["gps_valid"] = current_fix
+        d["gps_fix"] = current_fix
+        d["gps_locked"] = current_fix
         d["gps_status"] = gps_status
 
-        # Battery - use real device battery reading; DO NOT default to 90
-        batt = d.get("battery")
-        if batt is not None:
-            try:
-                b_int = int(batt)
-                d["battery"] = b_int
-                d["battery_level"] = b_int
-                d["batteryLevel"] = b_int
-                d["battery_percent"] = b_int
-                d["battery_pct"] = b_int
-                d["charge"] = b_int
-                d["battery_status"] = "normal" if b_int > 20 else "low"
-            except (ValueError, TypeError):
-                pass
+        self._apply_device_vitals(d)
 
         is_chg = bool(d.get("is_charging") or d.get("charging") or False)
         d["is_charging"] = is_chg
@@ -610,7 +898,13 @@ class FirestoreService:
         d["charge_status"] = "charging" if is_chg else "discharging"
 
         # Direction / Heading
-        h = float(d.get("heading") or d.get("bearing") or d.get("course") or d.get("direction_deg") or 0.0)
+        h = float(
+            d.get("heading")
+            or d.get("bearing")
+            or d.get("course")
+            or d.get("direction_deg")
+            or 0.0
+        )
         d["heading"] = h
         d["bearing"] = h
         d["course"] = h
@@ -856,10 +1150,7 @@ class FirestoreService:
                             })
 
                         if batt_val is not None:
-                            sync_doc["battery"] = batt_val
-                            sync_doc["battery_percent"] = batt_val
-                            sync_doc["battery_level"] = batt_val
-                            sync_doc["charge"] = batt_val
+                            sync_doc.update(_battery_fields(batt_val))
 
                         location = incoming_position if incoming_fix_is_valid else None
                         if location is not None and incoming_fix_time is not None:
@@ -1234,12 +1525,7 @@ class FirestoreService:
             "gps_status": gps_status,
         }
         if batt_val is not None:
-            device_update.update({
-                "battery": batt_val,
-                "battery_percent": batt_val,
-                "battery_level": batt_val,
-                "charge": batt_val,
-            })
+            device_update.update(_battery_fields(batt_val))
         if steps_val is not None:
             device_update["steps"] = steps_val
         if data.get("is_charging") is not None or data.get("charging") is not None:
@@ -1617,6 +1903,13 @@ class FirestoreService:
                 self._sync_worker_thread = None
 
     @staticmethod
+    def _looks_like_watch_frame(raw: Any) -> bool:
+        if not isinstance(raw, str):
+            return False
+        frame = raw.strip()
+        return frame.startswith("[") and frame.endswith("]") and "*" in frame
+
+    @staticmethod
     def _matches_raw_watch_gps_fix(device_id: str, fix: Dict[str, Any]) -> bool:
         raw = fix.get("raw")
         if not isinstance(raw, str):
@@ -1659,9 +1952,7 @@ class FirestoreService:
             raw_time = datetime.strptime(
                 f"{fields[1].strip()}{fields[2].strip()}", "%y%m%d%H%M%S"
             ).replace(tzinfo=timezone.utc)
-            stored_time = parse_iso_timestamp(
-                fix.get("timestamp") or fix.get("at") or fix.get("gps_time")
-            )
+            stored_time = parse_iso_timestamp(fix_event_timestamp(fix))
             return stored_time is not None and abs((raw_time - stored_time).total_seconds()) <= 1
         except (IndexError, TypeError, ValueError, UnicodeEncodeError):
             return False
@@ -1673,14 +1964,38 @@ class FirestoreService:
         if not isinstance(fix, dict):
             return None
 
+        # Explicit gps_fix false rejects the fix even if other flags are set.
+        if fix.get("gps_fix") is False:
+            return None
+
         gps_source = fix.get("gps_source") or fix.get("source")
-        if not gps_source and FirestoreService._matches_raw_watch_gps_fix(device_id, fix):
-            gps_source = "watch_frame"
+        has_fix_flag = any(
+            is_gps_valid_flag(fix.get(flag))
+            for flag in ("gps_valid", "gps_fix", "gps_locked")
+        )
+        latitude = fix.get("latitude", fix.get("lat"))
+        longitude = fix.get("longitude", fix.get("lon", fix.get("lng")))
+        timestamp = fix_event_timestamp(fix)
+
+        if not gps_source:
+            if FirestoreService._matches_raw_watch_gps_fix(device_id, fix):
+                gps_source = "watch_frame"
+            elif FirestoreService._looks_like_watch_frame(fix.get("raw")):
+                # Frame-shaped raw that failed validation must not be promoted.
+                return None
+            elif (
+                has_fix_flag
+                and valid_coordinate_pair(latitude, longitude) is not None
+                and normalize_iso_timestamp(timestamp)
+            ):
+                # Writer-shaped docs without gps_source are trusted as watch_tcp.
+                gps_source = "watch_tcp"
+
         verified_fix = normalize_verified_gps_fix(
-            any(is_gps_valid_flag(fix.get(flag)) for flag in ("gps_valid", "gps_fix", "gps_locked")),
-            fix.get("latitude", fix.get("lat")),
-            fix.get("longitude", fix.get("lon", fix.get("lng"))),
-            fix.get("timestamp") or fix.get("at") or fix.get("gps_time"),
+            has_fix_flag,
+            latitude,
+            longitude,
+            timestamp,
             gps_source,
             max_age_seconds=None
         )
@@ -1701,8 +2016,12 @@ class FirestoreService:
             "maps_url": f"https://maps.google.com/?q={latitude:.6f},{longitude:.6f}"
         }
 
+    @staticmethod
+    def _history_record_event_time(record: Dict[str, Any]) -> Optional[datetime]:
+        return parse_iso_timestamp(fix_event_timestamp(record))
+
     def _sync_firestore_telemetry_history(self, device_id: str, limit: int) -> None:
-        """Incrementally import verified fixes from both Firestore history locations."""
+        """Incrementally import verified fixes from history, telemetry, and logs."""
         if not is_firebase_active():
             return
 
@@ -1724,10 +2043,21 @@ class FirestoreService:
                         "telemetry",
                         db.collection("telemetry"),
                         True
-                    )
+                    ),
+                    (
+                        f"{device_id}::logs",
+                        "logs",
+                        db.collection("logs"),
+                        True
+                    ),
                 )
                 for sync_id, source_name, collection_ref, is_global in history_sources:
                     now = time.time()
+                    if time.monotonic() < self._history_firestore_retry_at.get(
+                        sync_id, 0.0
+                    ):
+                        continue
+
                     conn = sqlite3.connect(str(LOCAL_DB))
                     try:
                         state = conn.execute(
@@ -1752,44 +2082,96 @@ class FirestoreService:
                             query = query.where("device_id", "==", device_id)
 
                         if is_global:
-                            snapshots = list(query.stream(timeout=2.0))
-                            timestamped = [
-                                (snapshot, parse_iso_timestamp(
-                                    (snapshot.to_dict() or {}).get("timestamp")
-                                ))
-                                for snapshot in snapshots
-                            ]
-                            timestamped = [
-                                (snapshot, timestamp)
-                                for snapshot, timestamp in timestamped
-                                if timestamp is not None
-                            ]
-                            watermark_time = parse_iso_timestamp(watermark)
-                            if watermark is not None and watermark_time is None:
-                                app_logger.warning(
-                                    "Invalid Firestore history watermark; restarting sync "
-                                    "device=%s collection=%s",
-                                    device_id,
-                                    source_name
+                            watermark_prefix = (
+                                "logs_received_at"
+                                if source_name == "logs"
+                                else "telemetry_timestamp"
+                            )
+                            if source_name in {"logs", "telemetry"}:
+                                if watermark is not None and not (
+                                    watermark_kind or ""
+                                ).startswith(watermark_prefix):
+                                    watermark = None
+                                    watermark_kind = None
+
+                                watermark_field = (
+                                    "received_at" if source_name == "logs" else "timestamp"
                                 )
-                                watermark = None
-                                watermark_kind = None
-                            if watermark is None:
-                                timestamped.sort(key=lambda item: item[1], reverse=True)
+                                if watermark is None:
+                                    query = query.order_by(
+                                        watermark_field,
+                                        direction=cloud_firestore.Query.DESCENDING
+                                    ).limit(max(limit * 4, 2000))
+                                else:
+                                    query_value = (
+                                        parse_iso_timestamp(watermark)
+                                        if (watermark_kind or "").endswith("_datetime")
+                                        else watermark
+                                    )
+                                    query = query.where(
+                                        watermark_field, ">", query_value
+                                    ).order_by(
+                                        watermark_field,
+                                        direction=cloud_firestore.Query.ASCENDING
+                                    ).limit(500)
+
+                                snapshots = list(query.stream(timeout=10.0))
                             else:
+                                snapshots = list(query.stream(timeout=10.0))
                                 timestamped = [
-                                    item for item in timestamped
-                                    if item[1] > watermark_time
+                                    (snapshot, self._history_record_event_time(
+                                        snapshot.to_dict() or {}
+                                    ))
+                                    for snapshot in snapshots
                                 ]
-                                timestamped.sort(key=lambda item: item[1])
-                                timestamped = timestamped[:500]
-                            snapshots = [snapshot for snapshot, _ in timestamped]
+                                timestamped = [
+                                    (snapshot, timestamp)
+                                    for snapshot, timestamp in timestamped
+                                    if timestamp is not None
+                                ]
+                                watermark_time = parse_iso_timestamp(watermark)
+                                if watermark is not None and watermark_time is None:
+                                    app_logger.warning(
+                                        "Invalid Firestore history watermark; restarting sync "
+                                        "device=%s collection=%s",
+                                        device_id,
+                                        source_name
+                                    )
+                                    watermark = None
+                                    watermark_kind = None
+                                if watermark is None:
+                                    timestamped.sort(
+                                        key=lambda item: (
+                                            item[1],
+                                            parse_iso_timestamp(
+                                                (item[0].to_dict() or {}).get("received_at")
+                                            )
+                                            or datetime.min.replace(tzinfo=timezone.utc),
+                                        ),
+                                        reverse=True,
+                                    )
+                                else:
+                                    timestamped = [
+                                        item for item in timestamped
+                                        if item[1] > watermark_time
+                                    ]
+                                    timestamped.sort(
+                                        key=lambda item: (
+                                            item[1],
+                                            parse_iso_timestamp(
+                                                (item[0].to_dict() or {}).get("received_at")
+                                            )
+                                            or datetime.min.replace(tzinfo=timezone.utc),
+                                        )
+                                    )
+                                    timestamped = timestamped[:500]
+                                snapshots = [snapshot for snapshot, _ in timestamped]
                         elif watermark is None:
                             snapshots = list(
                                 query.order_by(
                                     "timestamp",
                                     direction=cloud_firestore.Query.DESCENDING
-                                ).stream(timeout=2.0)
+                                ).limit(max(limit, 500)).stream(timeout=10.0)
                             )
                         else:
                             query_value = (
@@ -1804,13 +2186,18 @@ class FirestoreService:
                                     direction=cloud_firestore.Query.ASCENDING
                                 )
                                 .limit(500)
-                                .stream(timeout=2.0)
+                                .stream(timeout=10.0)
                             )
 
                         records = []
                         skipped_count = 0
                         for snapshot in snapshots:
                             record = snapshot.to_dict() or {}
+                            if source_name == "logs" and str(
+                                record.get("type") or ""
+                            ).strip().lower() not in LOG_LOCATION_TYPES:
+                                skipped_count += 1
+                                continue
                             verified_fix = self._normalize_verified_fix(device_id, record)
                             if verified_fix is None:
                                 skipped_count += 1
@@ -1818,6 +2205,10 @@ class FirestoreService:
                             timestamp = verified_fix["timestamp"]
                             latitude = verified_fix["latitude"]
                             longitude = verified_fix["longitude"]
+                            battery = _first_present(
+                                record.get("battery"),
+                                record.get("battery_percent"),
+                            )
                             records.append((
                                 record.get("device_id") or device_id,
                                 timestamp,
@@ -1826,12 +2217,27 @@ class FirestoreService:
                                 latitude,
                                 longitude,
                                 float(record.get("speed_kmh") or record.get("speed") or 0.0),
-                                record.get("battery"),
+                                battery,
                                 record.get("steps"),
                                 verified_fix["maps_url"],
-                                float(record.get("heading") or record.get("bearing") or 0.0),
-                                float(record.get("bearing") or record.get("heading") or 0.0),
-                                float(record.get("course") or record.get("heading") or 0.0),
+                                float(
+                                    record.get("heading")
+                                    or record.get("bearing")
+                                    or record.get("direction_deg")
+                                    or 0.0
+                                ),
+                                float(
+                                    record.get("bearing")
+                                    or record.get("heading")
+                                    or record.get("direction_deg")
+                                    or 0.0
+                                ),
+                                float(
+                                    record.get("course")
+                                    or record.get("heading")
+                                    or record.get("direction_deg")
+                                    or 0.0
+                                ),
                                 int(bool(record.get("is_charging") or record.get("charging"))),
                                 int(bool(record.get("charging") or record.get("is_charging"))),
                                 verified_fix["gps_source"],
@@ -1849,18 +2255,39 @@ class FirestoreService:
                         next_watermark = watermark
                         next_kind = watermark_kind
                         if snapshots:
-                            watermark_snapshot = (
-                                snapshots[0] if watermark is None else snapshots[-1]
-                            )
-                            raw_timestamp = (watermark_snapshot.to_dict() or {}).get("timestamp")
-                            next_kind = (
-                                "datetime" if isinstance(raw_timestamp, datetime) else "string"
-                            )
-                            next_watermark = (
-                                normalize_iso_timestamp(raw_timestamp)
-                                if next_kind == "datetime"
-                                else str(raw_timestamp)
-                            )
+                            watermark_snapshot = snapshots[0] if watermark is None else snapshots[-1]
+                            raw_record = watermark_snapshot.to_dict() or {}
+                            if source_name == "logs":
+                                raw_timestamp = raw_record.get("received_at")
+                            elif source_name == "telemetry":
+                                raw_timestamp = raw_record.get("timestamp")
+                            else:
+                                raw_timestamp = fix_event_timestamp(raw_record)
+                            if raw_timestamp is None:
+                                raw_timestamp = raw_record.get("timestamp")
+                            normalized_watermark = normalize_iso_timestamp(raw_timestamp)
+                            if normalized_watermark:
+                                if source_name in {"logs", "telemetry"}:
+                                    watermark_prefix = (
+                                        "logs_received_at"
+                                        if source_name == "logs"
+                                        else "telemetry_timestamp"
+                                    )
+                                    next_kind = watermark_prefix + (
+                                        "_datetime"
+                                        if isinstance(raw_timestamp, datetime)
+                                        else "_string"
+                                    )
+                                else:
+                                    next_kind = (
+                                        "datetime"
+                                        if isinstance(raw_timestamp, datetime)
+                                        else "string"
+                                    )
+                                next_watermark = normalized_watermark
+                            elif raw_timestamp is not None:
+                                next_kind = "string"
+                                next_watermark = str(raw_timestamp)
 
                         conn = sqlite3.connect(str(LOCAL_DB))
                         try:
@@ -1890,6 +2317,8 @@ class FirestoreService:
                             conn.commit()
                         finally:
                             conn.close()
+                        self._history_firestore_retry_at.pop(sync_id, None)
+                        self._history_firestore_failures.pop(sync_id, None)
                         app_logger.info(
                             "Firestore GPS history sync succeeded device=%s collection=%s "
                             "scanned=%d verified=%d skipped=%d inserted=%d",
@@ -1901,10 +2330,22 @@ class FirestoreService:
                             inserted_count
                         )
                     except Exception as e:
+                        failures = self._history_firestore_failures.get(sync_id, 0) + 1
+                        self._history_firestore_failures[sync_id] = failures
+                        retry_delay = min(
+                            self.FIRESTORE_READ_RETRY_BASE_SECONDS *
+                            (2 ** min(failures - 1, 6)),
+                            self.FIRESTORE_READ_RETRY_MAX_SECONDS
+                        )
+                        self._history_firestore_retry_at[sync_id] = (
+                            time.monotonic() + retry_delay
+                        )
                         app_logger.error(
-                            "Firestore GPS history sync failed device=%s collection=%s: %s",
+                            "Firestore GPS history sync failed device=%s collection=%s "
+                            "retry_seconds=%d: %s",
                             device_id,
                             source_name,
+                            retry_delay,
                             e
                         )
                         conn = sqlite3.connect(str(LOCAL_DB))
@@ -1961,31 +2402,10 @@ class FirestoreService:
     ) -> Optional[Dict[str, Any]]:
         """Chooses the newest valid location from the device snapshot and SQLite history."""
         device_data = device_data or {}
-        device_lat = device_data.get("last_latitude")
-        if device_lat is None:
-            device_lat = device_data.get("latitude")
-        device_lon = device_data.get("last_longitude")
-        if device_lon is None:
-            device_lon = device_data.get("longitude")
-        device_time = device_data.get("last_valid_gps_time")
         location: Optional[Dict[str, Any]] = None
-        device_fix = self._normalize_verified_fix(device_id, {
-            "gps_valid": device_data.get("gps_valid"),
-            "latitude": device_lat,
-            "longitude": device_lon,
-            "timestamp": device_time,
-            "gps_source": device_data.get("gps_source")
-        })
-        if device_fix is not None:
-            location = {
-                **device_fix,
-                "maps_url": device_data.get("maps_url"),
-                "is_newer": False
-            }
-
-        latest = device_data.get("latest")
-        latest_location = latest.get("location") if isinstance(latest, dict) else None
-        for candidate in (device_data.get("last_fix"), latest_location):
+        for index, candidate in enumerate(
+            self._device_location_candidates(device_data)
+        ):
             verified_fix = self._normalize_verified_fix(device_id, candidate)
             if verified_fix is None:
                 continue
@@ -1994,7 +2414,13 @@ class FirestoreService:
             ):
                 location = {
                     **verified_fix,
-                    "is_newer": True
+                    **self._location_telemetry_fields(candidate),
+                    "maps_url": (
+                        device_data.get("maps_url")
+                        if index == 0 and device_data.get("maps_url")
+                        else verified_fix.get("maps_url")
+                    ),
+                    "is_newer": index > 0,
                 }
 
         telemetry = self.get_latest_valid_telemetry(device_id)
@@ -2019,6 +2445,7 @@ class FirestoreService:
                 "latitude": telemetry["latitude"],
                 "longitude": telemetry["longitude"],
                 "timestamp": telemetry_time,
+                **self._location_telemetry_fields(telemetry),
                 "maps_url": telemetry.get("maps_url"),
                 "gps_source": telemetry.get("gps_source"),
                 "is_newer": True
@@ -2043,16 +2470,10 @@ class FirestoreService:
         """Return a timestamped, clearly non-current position from the device snapshot."""
         device_data = device_data or {}
         device_id = str(device_data.get("device_id") or "")
-        latest = device_data.get("latest")
-        latest_location = latest.get("location") if isinstance(latest, dict) else None
-        root_fix = {
-            "latitude": device_data.get("last_latitude", device_data.get("latitude")),
-            "longitude": device_data.get("last_longitude", device_data.get("longitude")),
-            "timestamp": device_data.get("last_valid_gps_time"),
-            "gps_valid": device_data.get("gps_valid"),
-            "gps_source": device_data.get("gps_source")
-        }
-        candidates = [device_data.get("last_fix"), latest_location, root_fix]
+        candidates = self._device_location_candidates(device_data)
+        telemetry = self.get_latest_valid_telemetry(device_id)
+        if telemetry is not None:
+            candidates.append(telemetry)
         now = datetime.now(timezone.utc)
         known_locations = []
 
@@ -2063,9 +2484,7 @@ class FirestoreService:
                 candidate.get("latitude", candidate.get("lat")),
                 candidate.get("longitude", candidate.get("lon", candidate.get("lng")))
             )
-            timestamp = normalize_iso_timestamp(
-                candidate.get("timestamp") or candidate.get("at") or candidate.get("gps_time")
-            )
+            timestamp = normalize_iso_timestamp(fix_event_timestamp(candidate))
             fix_time = parse_iso_timestamp(timestamp)
             if position is None or fix_time is None or fix_time > now:
                 continue
@@ -2079,6 +2498,7 @@ class FirestoreService:
                 latitude, longitude = position
 
             age_seconds = (now - fix_time).total_seconds()
+            telemetry_fields = self._location_telemetry_fields(candidate)
             known_locations.append((
                 fix_time,
                 bool(verified_fix),
@@ -2086,6 +2506,13 @@ class FirestoreService:
                     "latitude": round(latitude, 6),
                     "longitude": round(longitude, 6),
                     "timestamp": timestamp,
+                    "age_seconds": max(0, int(age_seconds)),
+                    "accuracy_m": telemetry_fields["accuracy_m"],
+                    "speed": telemetry_fields["speed"],
+                    "speed_kmh": telemetry_fields["speed_kmh"],
+                    "heading": telemetry_fields["heading"],
+                    "bearing": telemetry_fields["bearing"],
+                    "coordinate_source": "last_known",
                     "received_at": normalize_iso_timestamp(candidate.get("received_at")),
                     "maps_url": f"https://maps.google.com/?q={latitude:.6f},{longitude:.6f}",
                     "gps_source": (
@@ -2148,8 +2575,14 @@ class FirestoreService:
             unique_records.append(record)
 
         unique_records.sort(
-            key=lambda record: parse_iso_timestamp(record.get("timestamp"))
-            or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda record: (
+                parse_iso_timestamp(
+                    record.get("gps_time") or record.get("timestamp")
+                )
+                or datetime.min.replace(tzinfo=timezone.utc),
+                parse_iso_timestamp(record.get("received_at"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+            ),
             reverse=True
         )
         return unique_records[:limit]

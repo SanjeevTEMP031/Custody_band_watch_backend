@@ -25,7 +25,8 @@ services:
 
     # Load environment variables from .env
     env_file:
-      - .env
+      - path: .env
+        required: false
 
     # Override / enforce container-level environment settings
     environment:
