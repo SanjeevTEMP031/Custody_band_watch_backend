@@ -160,6 +160,8 @@ def normalize_verified_gps_fix(
 class FirestoreService:
     DEVICE_CACHE_TTL_SECONDS = 10
     DEVICES_CACHE_TTL_SECONDS = 30
+    JOURNEY_CACHE_TTL_SECONDS = 30
+    HISTORY_SYNC_INTERVAL_SECONDS = 120
     FIRESTORE_READ_RETRY_BASE_SECONDS = 5
     FIRESTORE_READ_RETRY_MAX_SECONDS = 300
 
@@ -174,6 +176,9 @@ class FirestoreService:
         self._devices_firestore_failures = 0
         self._history_firestore_retry_at: Dict[str, float] = {}
         self._history_firestore_failures: Dict[str, int] = {}
+        self._journey_cache_lock = threading.RLock()
+        self._active_journey_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+        self._device_journeys_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._sync_worker_lock = threading.Lock()
         self._sync_worker_stop = threading.Event()
         self._sync_worker_thread: Optional[threading.Thread] = None
@@ -197,13 +202,16 @@ class FirestoreService:
         with self._device_cache_lock:
             self._device_cache[device_id] = (time.monotonic(), dict(device))
 
-    def _record_device_read_failure(self, device_id: str):
+    def _record_device_read_failure(self, device_id: str, is_quota_exceeded: bool = False):
         failures = self._device_firestore_failures.get(device_id, 0) + 1
         self._device_firestore_failures[device_id] = failures
-        delay = min(
-            self.FIRESTORE_READ_RETRY_BASE_SECONDS * (2 ** min(failures - 1, 6)),
-            self.FIRESTORE_READ_RETRY_MAX_SECONDS
-        )
+        if is_quota_exceeded:
+            delay = self.FIRESTORE_READ_RETRY_MAX_SECONDS
+        else:
+            delay = min(
+                self.FIRESTORE_READ_RETRY_BASE_SECONDS * (2 ** min(failures - 1, 6)),
+                self.FIRESTORE_READ_RETRY_MAX_SECONDS
+            )
         self._device_firestore_retry_at[device_id] = time.monotonic() + delay
 
     @staticmethod
@@ -1291,8 +1299,11 @@ class FirestoreService:
                     docs = db.collection("devices").stream(timeout=2.0)
                     remote_devices = []
                     for doc in docs:
+                        did = str(doc.id)
+                        if did.startswith("TEST_") or did.startswith("test_") or did == "863758061830999":
+                            continue
                         d = doc.to_dict() or {}
-                        d["device_id"] = doc.id
+                        d["device_id"] = did
                         remote_devices.append(d)
                     self._devices_firestore_failures = 0
                     self._devices_firestore_retry_at = 0.0
@@ -1317,11 +1328,16 @@ class FirestoreService:
                     return formatted
             except Exception as exc:
                 self._devices_firestore_failures += 1
-                delay = min(
-                    self.FIRESTORE_READ_RETRY_BASE_SECONDS
-                    * (2 ** min(self._devices_firestore_failures - 1, 6)),
-                    self.FIRESTORE_READ_RETRY_MAX_SECONDS
-                )
+                err_str = str(exc)
+                is_quota = "Quota exceeded" in err_str or "RESOURCE_EXHAUSTED" in err_str or "ResourceExhausted" in type(exc).__name__
+                if is_quota:
+                    delay = self.FIRESTORE_READ_RETRY_MAX_SECONDS
+                else:
+                    delay = min(
+                        self.FIRESTORE_READ_RETRY_BASE_SECONDS
+                        * (2 ** min(self._devices_firestore_failures - 1, 6)),
+                        self.FIRESTORE_READ_RETRY_MAX_SECONDS
+                    )
                 self._devices_firestore_retry_at = time.monotonic() + delay
                 app_logger.warning(
                     "Firestore get_devices deferred retry_seconds=%d exception_type=%s",
@@ -1356,6 +1372,9 @@ class FirestoreService:
         falls back to SQLite with explicit logging if Firebase is offline.
         """
         local_device = self._get_local_device(device_id)
+        if str(device_id).startswith("TEST_") or str(device_id).startswith("test_"):
+            return self._enrich_device_dict(local_device) if local_device else None
+
         cached_device = self._cached_device(device_id, allow_expired=True)
         fresh_cached_device = self._cached_device(device_id)
         if fresh_cached_device is not None:
@@ -1380,7 +1399,9 @@ class FirestoreService:
                         self._cache_device(device_id, merged)
                         return enriched
             except Exception as exc:
-                self._record_device_read_failure(device_id)
+                err_str = str(exc)
+                is_quota = "Quota exceeded" in err_str or "RESOURCE_EXHAUSTED" in err_str or "ResourceExhausted" in type(exc).__name__
+                self._record_device_read_failure(device_id, is_quota_exceeded=is_quota)
                 retry_in = max(
                     0,
                     int(
@@ -2025,6 +2046,15 @@ class FirestoreService:
         if not is_firebase_active():
             return
 
+        if str(device_id).startswith("TEST_") or str(device_id).startswith("test_"):
+            return
+
+        conn = sqlite3.connect(str(LOCAL_DB))
+        has_any_devices = bool(conn.execute("SELECT 1 FROM devices LIMIT 1").fetchone())
+        conn.close()
+        if has_any_devices and not self._get_local_device(device_id):
+            return
+
         with self._firestore_history_sync_lock:
             try:
                 db = get_firestore_client()
@@ -2070,7 +2100,7 @@ class FirestoreService:
                     finally:
                         conn.close()
 
-                    if state and now - state[2] < 15:
+                    if state and (now - state[2] < self.HISTORY_SYNC_INTERVAL_SECONDS):
                         continue
 
                     watermark, watermark_kind = (
@@ -2101,7 +2131,7 @@ class FirestoreService:
                                     query = query.order_by(
                                         watermark_field,
                                         direction=cloud_firestore.Query.DESCENDING
-                                    ).limit(max(limit * 4, 2000))
+                                    ).limit(min(max(limit * 2, 50), 100))
                                 else:
                                     query_value = (
                                         parse_iso_timestamp(watermark)
@@ -2113,7 +2143,7 @@ class FirestoreService:
                                     ).order_by(
                                         watermark_field,
                                         direction=cloud_firestore.Query.ASCENDING
-                                    ).limit(500)
+                                    ).limit(100)
 
                                 snapshots = list(query.stream(timeout=10.0))
                             else:
@@ -2164,7 +2194,7 @@ class FirestoreService:
                                             or datetime.min.replace(tzinfo=timezone.utc),
                                         )
                                     )
-                                    timestamped = timestamped[:500]
+                                    timestamped = timestamped[:max(limit, 500)]
                                 snapshots = [snapshot for snapshot, _ in timestamped]
                         elif watermark is None:
                             snapshots = list(
@@ -2185,7 +2215,7 @@ class FirestoreService:
                                     "timestamp",
                                     direction=cloud_firestore.Query.ASCENDING
                                 )
-                                .limit(500)
+                                .limit(max(limit, 500))
                                 .stream(timeout=10.0)
                             )
 
@@ -2265,29 +2295,26 @@ class FirestoreService:
                                 raw_timestamp = fix_event_timestamp(raw_record)
                             if raw_timestamp is None:
                                 raw_timestamp = raw_record.get("timestamp")
-                            normalized_watermark = normalize_iso_timestamp(raw_timestamp)
-                            if normalized_watermark:
-                                if source_name in {"logs", "telemetry"}:
-                                    watermark_prefix = (
-                                        "logs_received_at"
-                                        if source_name == "logs"
-                                        else "telemetry_timestamp"
-                                    )
-                                    next_kind = watermark_prefix + (
-                                        "_datetime"
-                                        if isinstance(raw_timestamp, datetime)
-                                        else "_string"
-                                    )
-                                else:
-                                    next_kind = (
-                                        "datetime"
-                                        if isinstance(raw_timestamp, datetime)
-                                        else "string"
-                                    )
-                                next_watermark = normalized_watermark
-                            elif raw_timestamp is not None:
-                                next_kind = "string"
-                                next_watermark = str(raw_timestamp)
+
+                            if source_name in {"logs", "telemetry"}:
+                                watermark_prefix = (
+                                    "logs_received_at"
+                                    if source_name == "logs"
+                                    else "telemetry_timestamp"
+                                )
+                                if isinstance(raw_timestamp, datetime):
+                                    next_kind = f"{watermark_prefix}_datetime"
+                                    next_watermark = raw_timestamp.isoformat()
+                                elif raw_timestamp is not None:
+                                    next_kind = f"{watermark_prefix}_string"
+                                    next_watermark = str(raw_timestamp)
+                            else:
+                                if isinstance(raw_timestamp, datetime):
+                                    next_kind = "datetime"
+                                    next_watermark = raw_timestamp.isoformat()
+                                elif raw_timestamp is not None:
+                                    next_kind = "string"
+                                    next_watermark = str(raw_timestamp)
 
                         conn = sqlite3.connect(str(LOCAL_DB))
                         try:
@@ -2330,23 +2357,42 @@ class FirestoreService:
                             inserted_count
                         )
                     except Exception as e:
+                        err_str = str(e)
+                        is_index_error = "The query requires an index" in err_str or "requires an index" in err_str or "FailedPrecondition" in type(e).__name__
+                        is_quota_error = "Quota exceeded" in err_str or "RESOURCE_EXHAUSTED" in err_str or "ResourceExhausted" in type(e).__name__
                         failures = self._history_firestore_failures.get(sync_id, 0) + 1
                         self._history_firestore_failures[sync_id] = failures
-                        retry_delay = min(
-                            self.FIRESTORE_READ_RETRY_BASE_SECONDS *
-                            (2 ** min(failures - 1, 6)),
-                            self.FIRESTORE_READ_RETRY_MAX_SECONDS
-                        )
+                        if is_index_error:
+                            retry_delay = 600
+                            app_logger.warning(
+                                "Firestore query for %s (%s) requires an index. "
+                                "Deploy firestore.indexes.json to enable this collection. Details: %s",
+                                device_id, source_name, e
+                            )
+                        elif is_quota_error:
+                            retry_delay = self.FIRESTORE_READ_RETRY_MAX_SECONDS
+                            app_logger.warning(
+                                "Firestore GPS history sync quota deferred device=%s collection=%s retry_seconds=%d",
+                                device_id,
+                                source_name,
+                                retry_delay
+                            )
+                        else:
+                            retry_delay = min(
+                                self.FIRESTORE_READ_RETRY_BASE_SECONDS *
+                                (2 ** min(failures - 1, 6)),
+                                self.FIRESTORE_READ_RETRY_MAX_SECONDS
+                            )
+                            app_logger.error(
+                                "Firestore GPS history sync failed device=%s collection=%s "
+                                "retry_seconds=%d: %s",
+                                device_id,
+                                source_name,
+                                retry_delay,
+                                e
+                            )
                         self._history_firestore_retry_at[sync_id] = (
                             time.monotonic() + retry_delay
-                        )
-                        app_logger.error(
-                            "Firestore GPS history sync failed device=%s collection=%s "
-                            "retry_seconds=%d: %s",
-                            device_id,
-                            source_name,
-                            retry_delay,
-                            e
                         )
                         conn = sqlite3.connect(str(LOCAL_DB))
                         try:
@@ -2531,27 +2577,58 @@ class FirestoreService:
             return None
         return max(known_locations, key=lambda item: (item[0], item[1]))[2]
 
-    def get_telemetry_history(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_telemetry_history(
+        self,
+        device_id: str,
+        limit: int = 50,
+        before_timestamp: Optional[str] = None,
+        after_timestamp: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        journey_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         self._sync_firestore_telemetry_history(device_id, limit)
         conn = sqlite3.connect(str(LOCAL_DB))
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
-                """
+            conditions = [
+                "device_id = ?",
+                "gps_valid = 1",
+                "gps_source IN ('watch_frame', 'watch_tcp', 'watch_udp', 'gps_ingest_api')",
+                "latitude BETWEEN -90 AND 90",
+                "longitude BETWEEN -180 AND 180",
+                "NOT (latitude = 0 AND longitude = 0)",
+                "julianday(timestamp) IS NOT NULL",
+                "julianday(timestamp) <= julianday('now')",
+            ]
+            params: List[Any] = [device_id]
+
+            if isinstance(before_timestamp, str) and before_timestamp.strip():
+                conditions.append("julianday(timestamp) < julianday(?)")
+                params.append(before_timestamp.strip())
+            if isinstance(after_timestamp, str) and after_timestamp.strip():
+                conditions.append("julianday(timestamp) > julianday(?)")
+                params.append(after_timestamp.strip())
+            if isinstance(start_time, str) and start_time.strip():
+                conditions.append("julianday(timestamp) >= julianday(?)")
+                params.append(start_time.strip())
+            if isinstance(end_time, str) and end_time.strip():
+                conditions.append("julianday(timestamp) <= julianday(?)")
+                params.append(end_time.strip())
+            if isinstance(journey_id, str) and journey_id.strip():
+                conditions.append("journey_id = ?")
+                params.append(journey_id.strip())
+
+            limit_int = int(limit) if isinstance(limit, (int, float, str)) and str(limit).isdigit() else 50
+            sql = f"""
                 SELECT * FROM telemetry
-                WHERE device_id = ?
-                  AND gps_valid = 1
-                  AND gps_source IN ('watch_frame', 'watch_tcp', 'watch_udp', 'gps_ingest_api')
-                  AND latitude BETWEEN -90 AND 90
-                  AND longitude BETWEEN -180 AND 180
-                  AND NOT (latitude = 0 AND longitude = 0)
-                  AND julianday(timestamp) IS NOT NULL
-                  AND julianday(timestamp) <= julianday('now')
+                WHERE {' AND '.join(conditions)}
                 ORDER BY julianday(timestamp) DESC, id DESC
                 LIMIT ?
-                """,
-                (device_id, limit)
-            ).fetchall()
+            """
+            params.append(limit_int)
+
+            rows = conn.execute(sql, params).fetchall()
             records = [dict(row) for row in rows]
         finally:
             conn.close()
@@ -2704,6 +2781,11 @@ class FirestoreService:
         except Exception as e:
             app_logger.error(f"SQLite save_journey error: {e}")
 
+        # Invalidate in-memory journey cache immediately on change
+        with self._journey_cache_lock:
+            self._active_journey_cache.pop(dev_id, None)
+            self._device_journeys_cache.pop(dev_id, None)
+
         # 2. Async Firestore Sync
         if is_firebase_active():
             def _bg_sync():
@@ -2739,22 +2821,13 @@ class FirestoreService:
 
     def get_active_journey(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves currently ACTIVE journey for a device."""
-        if is_firebase_active():
-            try:
-                db = get_firestore_client()
-                if db:
-                    dev_doc = db.collection("devices").document(device_id).get(timeout=2.0)
-                    if dev_doc.exists:
-                        active_id = dev_doc.to_dict().get("active_journey_id")
-                        if active_id:
-                            j_doc = db.collection("journeys").document(active_id).get(timeout=2.0)
-                            if j_doc.exists:
-                                d = j_doc.to_dict()
-                                d["id"] = j_doc.id
-                                return d
-            except Exception as e:
-                app_logger.error(f"Firestore get_active_journey failed: {e}")
+        now = time.monotonic()
+        with self._journey_cache_lock:
+            cached = self._active_journey_cache.get(device_id)
+            if cached and now - cached[0] < self.JOURNEY_CACHE_TTL_SECONDS:
+                return dict(cached[1]) if cached[1] else None
 
+        # Check local SQLite first (authoritative and fast)
         conn = sqlite3.connect(str(LOCAL_DB))
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2781,38 +2854,49 @@ class FirestoreService:
                     "longitude": d["end_longitude"],
                     "timestamp": d.get("end_time")
                 }
+            with self._journey_cache_lock:
+                self._active_journey_cache[device_id] = (now, dict(d))
             return d
-        return None
 
-    def get_device_journeys(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Retrieves all journeys for a device in reverse chronological order."""
         if is_firebase_active():
             try:
                 db = get_firestore_client()
                 if db:
-                    docs = db.collection("devices").document(device_id).collection("journeys")\
-                        .order_by("created_at", direction="DESCENDING")\
-                        .limit(limit)\
-                        .stream(timeout=2.0)
-                    results = []
-                    for d in docs:
-                        data = d.to_dict()
-                        data["id"] = d.id
-                        results.append(data)
-                    if results:
-                        return results
+                    dev_doc = db.collection("devices").document(device_id).get(timeout=2.0)
+                    if dev_doc.exists:
+                        active_id = dev_doc.to_dict().get("active_journey_id")
+                        if active_id:
+                            j_doc = db.collection("journeys").document(active_id).get(timeout=2.0)
+                            if j_doc.exists:
+                                d = j_doc.to_dict()
+                                d["id"] = j_doc.id
+                                with self._journey_cache_lock:
+                                    self._active_journey_cache[device_id] = (now, dict(d))
+                                return d
             except Exception as e:
-                app_logger.error(f"Firestore get_device_journeys failed: {e}")
+                app_logger.error(f"Firestore get_active_journey failed: {e}")
+
+        with self._journey_cache_lock:
+            self._active_journey_cache[device_id] = (now, None)
+        return None
+
+    def get_device_journeys(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieves all journeys for a device in reverse chronological order."""
+        now = time.monotonic()
+        with self._journey_cache_lock:
+            cached = self._device_journeys_cache.get(device_id)
+            if cached and now - cached[0] < self.JOURNEY_CACHE_TTL_SECONDS:
+                return [dict(j) for j in cached[1][:limit]]
 
         conn = sqlite3.connect(str(LOCAL_DB))
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         rows = cur.execute(
-            "SELECT * FROM journeys WHERE device_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM journeys WHERE device_id = ? ORDER BY julianday(start_time) DESC, created_at DESC LIMIT ?",
             (device_id, limit)
         ).fetchall()
         conn.close()
-        results = []
+        local_results = []
         for r in rows:
             d = dict(r)
             try:
@@ -2831,8 +2915,34 @@ class FirestoreService:
                     "longitude": d["end_longitude"],
                     "timestamp": d.get("end_time")
                 }
-            results.append(d)
-        return results
+            local_results.append(d)
+
+        if local_results:
+            with self._journey_cache_lock:
+                self._device_journeys_cache[device_id] = (now, [dict(j) for j in local_results])
+            return local_results
+
+        if is_firebase_active():
+            try:
+                db = get_firestore_client()
+                if db:
+                    docs = db.collection("devices").document(device_id).collection("journeys")\
+                        .order_by("created_at", direction="DESCENDING")\
+                        .limit(limit)\
+                        .stream(timeout=2.0)
+                    results = []
+                    for d in docs:
+                        data = d.to_dict()
+                        data["id"] = d.id
+                        results.append(data)
+                    if results:
+                        with self._journey_cache_lock:
+                            self._device_journeys_cache[device_id] = (now, [dict(j) for j in results])
+                        return results
+            except Exception as e:
+                app_logger.error(f"Firestore get_device_journeys failed: {e}")
+
+        return local_results
 
     def get_journey(self, journey_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single journey by ID."""

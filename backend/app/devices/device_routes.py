@@ -184,6 +184,15 @@ def register_device(device_in: DeviceCreate):
     return device_service.register_device(device_in.model_dump())
 
 
+@router.get("/{device_id}/alert-status", response_model=Dict[str, Any])
+def get_device_alert_status(device_id: str):
+    """
+    Retrieve real-time alert summary, sensor states, connectivity, and last known location snapshot.
+    """
+    from ..services.alert_service import alert_service
+    return alert_service.get_device_alert_status(device_id)
+
+
 @router.get("/{device_id}", response_model=Dict[str, Any])
 def get_device(device_id: str):
     """

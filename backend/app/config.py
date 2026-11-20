@@ -48,6 +48,15 @@ try:
         DEFAULT_WATCH_BATTERY: int = 90
         AUTO_POLL_GPS_ON_PING: bool = True
 
+        # Alert Configuration defaults
+        ALERT_WATCH_OFFLINE_SECONDS: int = 120
+        ALERT_LOW_BATTERY_PERCENT: int = 20
+        ALERT_GPS_UNAVAILABLE_SECONDS: int = 120
+        ALERT_REPEATED_DISCONNECT_COUNT: int = 3
+        ALERT_REPEATED_DISCONNECT_WINDOW_SECONDS: int = 600
+        ALERT_VEHICLE_SEPARATION_METERS: float = 100.0
+        ALERT_UNSCHEDULED_STOP_MINUTES: float = 5.0
+
         model_config = {
             "env_file": str(ENV_FILE),
             "env_file_encoding": "utf-8",
@@ -88,5 +97,13 @@ except ImportError:
         DEFAULT_MANUFACTURER: str = os.getenv("DEFAULT_MANUFACTURER", "MNYD")
         DEFAULT_WATCH_IMEI: str = os.getenv("DEFAULT_WATCH_IMEI", "863758061830955")
         AUTO_POLL_GPS_ON_PING: bool = os.getenv("AUTO_POLL_GPS_ON_PING", "true").lower() == "true"
+
+        ALERT_WATCH_OFFLINE_SECONDS: int = int(os.getenv("ALERT_WATCH_OFFLINE_SECONDS", 120))
+        ALERT_LOW_BATTERY_PERCENT: int = int(os.getenv("ALERT_LOW_BATTERY_PERCENT", 20))
+        ALERT_GPS_UNAVAILABLE_SECONDS: int = int(os.getenv("ALERT_GPS_UNAVAILABLE_SECONDS", 120))
+        ALERT_REPEATED_DISCONNECT_COUNT: int = int(os.getenv("ALERT_REPEATED_DISCONNECT_COUNT", 3))
+        ALERT_REPEATED_DISCONNECT_WINDOW_SECONDS: int = int(os.getenv("ALERT_REPEATED_DISCONNECT_WINDOW_SECONDS", 600))
+        ALERT_VEHICLE_SEPARATION_METERS: float = float(os.getenv("ALERT_VEHICLE_SEPARATION_METERS", 100.0))
+        ALERT_UNSCHEDULED_STOP_MINUTES: float = float(os.getenv("ALERT_UNSCHEDULED_STOP_MINUTES", 5.0))
 
     settings = SettingsFallback()

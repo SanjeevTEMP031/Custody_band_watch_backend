@@ -2,8 +2,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from backend.app.custody.custody_routes import _format_custody_record
-from backend.app.gps.gps_routes import get_live_locations
+from app.custody.custody_routes import _format_custody_record
+from app.gps.gps_routes import get_live_locations
 
 
 class CustodyLocationTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class CustodyLocationTests(unittest.TestCase):
         self.assertIsNone(record["longitude"])
         self.assertIsNone(record["maps_url"])
 
-    @patch("backend.app.gps.gps_routes.device_service.get_all_devices")
+    @patch("app.gps.gps_routes.device_service.get_all_devices")
     def test_live_endpoint_returns_latest_device_coordinates(self, get_devices):
         device = {
             "device_id": "watch-5",
@@ -75,7 +75,7 @@ class CustodyLocationTests(unittest.TestCase):
         self.assertEqual((first_location["latitude"], first_location["longitude"]), (17.1, 78.1))
         self.assertEqual((second_location["latitude"], second_location["longitude"]), (17.2, 78.2))
 
-    @patch("backend.app.gps.gps_routes.device_service.get_all_devices")
+    @patch("app.gps.gps_routes.device_service.get_all_devices")
     def test_live_endpoint_preserves_zero_latitude(self, get_devices):
         get_devices.return_value = [{
             "device_id": "watch-6",

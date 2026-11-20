@@ -1,267 +1,26 @@
-# """
-# Journey Tracking Service
-# Manages real-time custody band travel routes, calculates travelled distance
-# using the Haversine formula, and synchronizes journey lifecycle to Firestore & SQLite.
-# """
-
-# import math
-# from datetime import datetime, timezone
-# from typing import Dict, Any, Optional, List
-# from ..utils.datetime_utils import current_iso_timestamp
-# from ..utils.logger import app_logger, gps_logger
-# from .firestore_service import firestore_service
-# from .gps_service import gps_service
-
-
-# def format_duration(seconds: float) -> str:
-#     """Formats duration in seconds to HH:MM:SS."""
-#     s = int(max(0, seconds))
-#     hours = s // 3600
-#     minutes = (s % 3600) // 60
-#     secs = s % 60
-#     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-# class JourneyService:
-#     def __init__(self):
-#         # In-memory fast cache for active journeys: device_id -> journey_dict
-#         self._active_journeys: Dict[str, Dict[str, Any]] = {}
-
-#     def get_active_journey(self, device_id: str) -> Optional[Dict[str, Any]]:
-#         """Returns the current active journey for a device, checking memory and persistence."""
-#         if device_id in self._active_journeys:
-#             return self._active_journeys[device_id]
-
-#         persisted = firestore_service.get_active_journey(device_id)
-#         if persisted:
-#             self._active_journeys[device_id] = persisted
-#             return persisted
-
-#         return None
-
-#     def start_journey(self, device_id: str) -> Dict[str, Any]:
-#         """
-#         Starts a new journey for the custody device.
-#         Captures initial valid coordinates if available, otherwise initializes
-#         to capture the first valid incoming GPS fix.
-#         """
-#         # If an active journey already exists, return it
-#         existing = self.get_active_journey(device_id)
-#         if existing and existing.get("status") == "ACTIVE":
-#             app_logger.info(f"[JOURNEY] Device {device_id} already has active journey {existing.get('journey_id')}")
-#             return existing
-
-#         now_iso = current_iso_timestamp()
-#         journey_id = f"journey_{device_id}_{int(datetime.now(timezone.utc).timestamp())}"
-
-#         # Check latest device location
-#         dev = firestore_service.get_device(device_id) or {}
-#         lat = dev.get("last_latitude")
-#         lon = dev.get("last_longitude")
-#         gps_valid = bool(dev.get("gps_valid", False)) and (lat is not None and lon is not None)
-
-#         start_location = None
-#         route_coordinates: List[Dict[str, Any]] = []
-
-#         if gps_valid and lat is not None and lon is not None and (lat != 0.0 or lon != 0.0):
-#             start_location = {
-#                 "latitude": round(float(lat), 6),
-#                 "longitude": round(float(lon), 6),
-#                 "timestamp": dev.get("last_valid_gps_time") or now_iso,
-#                 "speed_kmh": float(dev.get("speed_kmh") or dev.get("speed") or 0.0)
-#             }
-#             route_coordinates.append(start_location)
-
-#         journey: Dict[str, Any] = {
-#             "journey_id": journey_id,
-#             "id": journey_id,
-#             "device_id": device_id,
-#             "status": "ACTIVE",
-#             "start_time": now_iso,
-#             "end_time": None,
-#             "start_location": start_location,
-#             "end_location": None,
-#             "route_coordinates": route_coordinates,
-#             "total_distance_km": 0.0,
-#             "duration_seconds": 0,
-#             "duration_formatted": "00:00:00",
-#             "points_count": len(route_coordinates),
-#             "created_at": now_iso,
-#             "updated_at": now_iso
-#         }
-
-#         self._active_journeys[device_id] = journey
-#         firestore_service.save_journey(journey)
-#         app_logger.info(f"[JOURNEY START] Device {device_id} started journey {journey_id} (Initial fix: {bool(start_location)})")
-#         return journey
-
-#     def record_journey_point(
-#         self,
-#         device_id: str,
-#         latitude: float,
-#         longitude: float,
-#         timestamp: str,
-#         speed_kmh: float = 0.0
-#     ) -> Optional[Dict[str, Any]]:
-#         """
-#         Records a valid incoming GPS coordinate during an active journey.
-#         Validates coordinates, ignores duplicates, and calculates Haversine distance.
-#         """
-#         journey = self.get_active_journey(device_id)
-#         if not journey or journey.get("status") != "ACTIVE":
-#             return None
-
-#         # Validate coordinate bounds
-#         if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0 and (latitude != 0.0 or longitude != 0.0)):
-#             return None
-
-#         new_point = {
-#             "latitude": round(float(latitude), 6),
-#             "longitude": round(float(longitude), 6),
-#             "timestamp": timestamp,
-#             "speed_kmh": round(float(speed_kmh), 1)
-#         }
-
-#         route = journey.get("route_coordinates", [])
-
-#         # If start_location was not captured at start click, lock it in now
-#         if not journey.get("start_location"):
-#             journey["start_location"] = new_point
-#             route = [new_point]
-#             journey["route_coordinates"] = route
-#             journey["points_count"] = 1
-#             journey["updated_at"] = timestamp
-#             firestore_service.save_journey(journey)
-#             app_logger.info(f"[JOURNEY] Device {device_id} locked initial START fix: ({latitude}, {longitude})")
-#             return journey
-
-#         # Duplicate check: compare against last recorded point
-#         if route:
-#             prev_point = route[-1]
-#             prev_lat = prev_point["latitude"]
-#             prev_lon = prev_point["longitude"]
-
-#             # Exact duplicate check
-#             if prev_lat == new_point["latitude"] and prev_lon == new_point["longitude"]:
-#                 return journey
-
-#             # Haversine distance from previous point in meters
-#             dist_meters = gps_service.calculate_distance_meters(
-#                 prev_lat, prev_lon,
-#                 new_point["latitude"], new_point["longitude"]
-#             )
-
-#             # Ignore noise under 2.5 meters
-#             if dist_meters < 2.5:
-#                 return journey
-
-#             incremental_km = dist_meters / 1000.0
-#             journey["total_distance_km"] = round(float(journey.get("total_distance_km", 0.0)) + incremental_km, 3)
-
-#         route.append(new_point)
-#         journey["route_coordinates"] = route
-#         journey["points_count"] = len(route)
-#         journey["updated_at"] = timestamp
-
-#         # Compute current elapsed duration
-#         try:
-#             st = datetime.fromisoformat(journey["start_time"].replace("Z", "+00:00"))
-#             ct = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-#             dur = max(0, (ct - st).total_seconds())
-#             journey["duration_seconds"] = int(dur)
-#             journey["duration_formatted"] = format_duration(dur)
-#         except Exception:
-#             pass
-
-#         firestore_service.save_journey(journey)
-#         return journey
-
-#     def end_journey(self, device_id: str, journey_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-#         """
-#         Ends an active journey for the custody device.
-#         Captures final valid GPS coordinates, sets end timestamp,
-#         computes final duration and distance.
-#         """
-#         journey = self.get_active_journey(device_id)
-#         if not journey:
-#             # Check if specific journey_id was requested
-#             if journey_id:
-#                 journey = firestore_service.get_journey(journey_id)
-#             if not journey or journey.get("status") != "ACTIVE":
-#                 app_logger.warning(f"[JOURNEY END] No active journey found for device {device_id}")
-#                 return None
-
-#         now_iso = current_iso_timestamp()
-#         route = journey.get("route_coordinates", [])
-
-#         # End location is the last valid point in the route or device's current valid location
-#         end_location = None
-#         if route:
-#             end_location = route[-1]
-#         else:
-#             dev = firestore_service.get_device(device_id) or {}
-#             lat = dev.get("last_latitude")
-#             lon = dev.get("last_longitude")
-#             if lat is not None and lon is not None and (lat != 0.0 or lon != 0.0):
-#                 end_location = {
-#                     "latitude": round(float(lat), 6),
-#                     "longitude": round(float(lon), 6),
-#                     "timestamp": dev.get("last_valid_gps_time") or now_iso,
-#                     "speed_kmh": float(dev.get("speed_kmh") or 0.0)
-#                 }
-
-#         journey["status"] = "COMPLETED"
-#         journey["end_time"] = now_iso
-#         journey["end_location"] = end_location
-#         journey["updated_at"] = now_iso
-
-#         # Calculate final duration
-#         try:
-#             st = datetime.fromisoformat(journey["start_time"].replace("Z", "+00:00"))
-#             et = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
-#             dur = max(0, (et - st).total_seconds())
-#             journey["duration_seconds"] = int(dur)
-#             journey["duration_formatted"] = format_duration(dur)
-#         except Exception:
-#             journey["duration_seconds"] = 0
-#             journey["duration_formatted"] = "00:00:00"
-
-#         # Remove from active cache
-#         self._active_journeys.pop(device_id, None)
-
-#         firestore_service.save_journey(journey)
-#         app_logger.info(
-#             f"[JOURNEY END] Device {device_id} completed journey {journey['journey_id']}: "
-#             f"Distance: {journey['total_distance_km']} km, Duration: {journey['duration_formatted']}, Points: {len(route)}"
-#         )
-#         return journey
-
-#     def get_device_journeys(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-#         """Returns completed and active journey history for a device."""
-#         return firestore_service.get_device_journeys(device_id, limit=limit)
-
-#     def get_journey(self, journey_id: str) -> Optional[Dict[str, Any]]:
-#         """Returns full journey details by ID."""
-#         return firestore_service.get_journey(journey_id)
-
-
-# journey_service = JourneyService()
-
-
 """
 Journey Tracking Service
 Manages custody band journeys, GPS route tracking,
-distance calculation, and Firestore synchronization.
+distance calculation, automatic journey lifecycle, and Firestore/SQLite synchronization.
 """
 
 import math
+import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
+from ..config import settings
 from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import app_logger, gps_logger
-from .firestore_service import firestore_service, normalize_verified_gps_fix
+from .firestore_service import (
+    firestore_service,
+    normalize_verified_gps_fix,
+    normalize_iso_timestamp,
+    parse_iso_timestamp,
+    LOCAL_DB,
+)
 from .gps_service import gps_service
 
 
@@ -276,34 +35,19 @@ def format_duration(seconds: float) -> str:
 
 class JourneyService:
     def __init__(self):
+        self._lock = threading.Lock()
         self._active_journeys: Dict[str, Dict[str, Any]] = {}
-
-    def get_active_journey(
-        self, device_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Get an active journey from memory or Firestore."""
-
-        journey = self._active_journeys.get(device_id)
-
-        if journey and journey.get("status") == "ACTIVE":
-            return journey
-
-        persisted = firestore_service.get_active_journey(device_id)
-
-        if persisted and persisted.get("status") == "ACTIVE":
-            self._active_journeys[device_id] = persisted
-            return persisted
-
-        return None
+        # Inactivity timeout: 30 minutes (1800s) default
+        self.inactivity_timeout_seconds: float = float(
+            getattr(settings, "JOURNEY_INACTIVITY_TIMEOUT_SECONDS", 1800)
+        )
 
     @staticmethod
-    def _valid_coordinates(latitude, longitude) -> bool:
-        """Check whether coordinates are valid GPS coordinates."""
-
+    def _valid_coordinates(latitude: Any, longitude: Any) -> bool:
+        """Check whether coordinates are valid, finite, and non-zero."""
         try:
             lat = float(latitude)
             lon = float(longitude)
-
             return (
                 math.isfinite(lat)
                 and math.isfinite(lon)
@@ -318,20 +62,16 @@ class JourneyService:
         self, device: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Read the last known verified GPS location for a journey endpoint."""
-
         lat = device.get("last_latitude")
         lon = device.get("last_longitude")
 
         if lat is None:
             lat = device.get("latitude")
-
         if lon is None:
             lon = device.get("longitude")
 
         gps_status = str(
-            device.get("gps_status")
-            or device.get("gps_fix_status")
-            or ""
+            device.get("gps_status") or device.get("gps_fix_status") or ""
         ).strip().upper()
         if gps_status == "V":
             return None
@@ -347,68 +87,134 @@ class JourneyService:
             return None
 
         latitude, longitude, timestamp, _ = fix
-
         return {
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": round(float(latitude), 6),
+            "longitude": round(float(longitude), 6),
             "timestamp": timestamp,
-            "speed_kmh": float(
-                device.get("speed_kmh") or device.get("speed") or 0.0
+            "speed_kmh": round(
+                float(device.get("speed_kmh") or device.get("speed") or 0.0), 1
             ),
         }
 
-    def start_journey(self, device_id: str) -> Dict[str, Any]:
-        """Start a new journey and capture its initial valid GPS fix."""
-
-        existing = self.get_active_journey(device_id)
-
-        if existing:
-            app_logger.info(
-                f"[JOURNEY] Device {device_id} already has active "
-                f"journey {existing.get('journey_id')}"
+    def _tag_telemetry_journey(
+        self, device_id: str, timestamp: str, journey_id: str
+    ) -> None:
+        """Associate SQLite telemetry record with the active journey ID."""
+        try:
+            conn = sqlite3.connect(str(LOCAL_DB))
+            conn.execute(
+                """
+                UPDATE telemetry
+                SET journey_id = ?
+                WHERE device_id = ?
+                  AND (timestamp = ? OR julianday(timestamp) = julianday(?))
+                """,
+                (journey_id, device_id, timestamp, timestamp),
             )
-            return existing
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            app_logger.debug(
+                f"[JOURNEY] Failed to tag telemetry with journey_id: {exc}"
+            )
 
-        now_iso = current_iso_timestamp()
-        journey_id = f"journey_{device_id}_{uuid.uuid4().hex[:12]}"
+    @staticmethod
+    def _update_journey_duration(journey: Dict[str, Any], current_timestamp: str) -> None:
+        """Recalculate elapsed journey duration in seconds and formatted string."""
+        try:
+            start_iso = journey.get("start_time")
+            if not start_iso:
+                return
+            st = parse_iso_timestamp(start_iso)
+            ct = parse_iso_timestamp(current_timestamp)
+            if st and ct:
+                dur = max(0, int((ct - st).total_seconds()))
+                journey["duration_seconds"] = dur
+                journey["duration_formatted"] = format_duration(dur)
+        except Exception:
+            pass
 
-        device = firestore_service.get_device(device_id) or {}
+    def get_active_journey(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Get an active journey from memory, SQLite, or Firestore."""
+        journey = self._active_journeys.get(device_id)
+        if journey and journey.get("status") == "ACTIVE":
+            return journey
 
-        start_location = self._get_initial_device_location(device)
+        persisted = firestore_service.get_active_journey(device_id)
+        if persisted and persisted.get("status") == "ACTIVE":
+            self._active_journeys[device_id] = persisted
+            return persisted
 
-        route_coordinates: List[Dict[str, Any]] = []
+        return None
 
-        if start_location:
-            route_coordinates.append(start_location)
+    def start_journey(
+        self,
+        device_id: str,
+        start_time: Optional[str] = None,
+        initial_location: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Start a new journey and capture its initial valid GPS fix.
+        Thread-safe; if an active journey exists, returns it without creating a duplicate.
+        """
+        with self._lock:
+            existing = self.get_active_journey(device_id)
+            if existing and existing.get("status") == "ACTIVE":
+                app_logger.info(
+                    f"[JOURNEY] Device {device_id} already has active "
+                    f"journey {existing.get('journey_id')}"
+                )
+                return existing
 
-        journey = {
-            "journey_id": journey_id,
-            "id": journey_id,
-            "device_id": device_id,
-            "status": "ACTIVE",
-            "start_time": now_iso,
-            "end_time": None,
-            "start_location": start_location,
-            "end_location": None,
-            "route_coordinates": route_coordinates,
-            "total_distance_km": 0.0,
-            "duration_seconds": 0,
-            "duration_formatted": "00:00:00",
-            "points_count": len(route_coordinates),
-            "created_at": now_iso,
-            "updated_at": now_iso,
-        }
+            now_iso = current_iso_timestamp()
+            st = start_time or now_iso
+            journey_id = f"journey_{device_id}_{uuid.uuid4().hex[:12]}"
 
-        self._active_journeys[device_id] = journey
-        firestore_service.save_journey(journey)
+            start_location = None
+            if initial_location and self._valid_coordinates(
+                initial_location.get("latitude"), initial_location.get("longitude")
+            ):
+                start_location = {
+                    "latitude": round(float(initial_location["latitude"]), 6),
+                    "longitude": round(float(initial_location["longitude"]), 6),
+                    "timestamp": initial_location.get("timestamp") or st,
+                    "speed_kmh": round(float(initial_location.get("speed_kmh") or 0.0), 1),
+                }
+            else:
+                device = firestore_service.get_device(device_id) or {}
+                start_location = self._get_initial_device_location(device)
 
-        app_logger.info(
-            f"[JOURNEY START] Device {device_id}, "
-            f"Journey {journey_id}, "
-            f"Initial GPS fix: {bool(start_location)}"
-        )
+            route_coordinates: List[Dict[str, Any]] = []
+            if start_location:
+                route_coordinates.append(start_location)
 
-        return journey
+            journey: Dict[str, Any] = {
+                "journey_id": journey_id,
+                "id": journey_id,
+                "device_id": device_id,
+                "status": "ACTIVE",
+                "start_time": st,
+                "end_time": None,
+                "start_location": start_location,
+                "end_location": None,
+                "route_coordinates": route_coordinates,
+                "total_distance_km": 0.0,
+                "duration_seconds": 0,
+                "duration_formatted": "00:00:00",
+                "points_count": len(route_coordinates),
+                "created_at": now_iso,
+                "updated_at": st,
+            }
+
+            self._active_journeys[device_id] = journey
+            firestore_service.save_journey(journey)
+
+            app_logger.info(
+                f"[JOURNEY START] Device {device_id}, "
+                f"Journey {journey_id}, "
+                f"Initial GPS fix: {bool(start_location)}"
+            )
+            return journey
 
     def record_journey_point(
         self,
@@ -418,148 +224,210 @@ class JourneyService:
         timestamp: str,
         speed_kmh: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
-        """Record a valid GPS point and calculate travelled distance."""
-
-        journey = self.get_active_journey(device_id)
-
-        if not journey or journey.get("status") != "ACTIVE":
-            return None
-
+        """
+        Record a valid GPS point and calculate travelled distance.
+        Automatically starts a new persistent journey on the first valid incoming fix
+        if no active journey exists.
+        Thread-safe; maintains continuous travel across 15m, 45m, 1h, 2h, 4h, 8h+ trips.
+        """
         if not self._valid_coordinates(latitude, longitude):
             gps_logger.warning(
-                f"[JOURNEY] Ignored invalid GPS point for {device_id}: "
-                f"{latitude}, {longitude}"
+                f"[JOURNEY REJECTED] Invalid coordinates for {device_id}: "
+                f"lat={latitude}, lon={longitude}"
             )
             return None
 
-        new_point = {
-            "latitude": round(float(latitude), 6),
-            "longitude": round(float(longitude), 6),
-            "timestamp": timestamp,
-            "speed_kmh": round(float(speed_kmh or 0.0), 1),
-        }
-
-        route = journey.setdefault("route_coordinates", [])
-
-        # Capture the first valid GPS fix if no starting fix was
-        # available when the journey began.
-        if not journey.get("start_location"):
-            journey["start_location"] = new_point
-            journey["route_coordinates"] = [new_point]
-            journey["points_count"] = 1
-            journey["updated_at"] = timestamp
-
-            firestore_service.save_journey(journey)
-
-            app_logger.info(
-                f"[JOURNEY] Captured first valid GPS fix for "
-                f"{device_id}: ({latitude}, {longitude})"
-            )
-
-            return journey
-
-        # Ignore exact duplicate coordinates.
-        if route:
-            previous_point = route[-1]
-
-            previous_lat = float(previous_point["latitude"])
-            previous_lon = float(previous_point["longitude"])
-
-            if (
-                previous_lat == new_point["latitude"]
-                and previous_lon == new_point["longitude"]
-            ):
-                return journey
-
-            # Calculate distance from the previous GPS point.
-            distance_meters = gps_service.calculate_distance_meters(
-                previous_lat,
-                previous_lon,
-                new_point["latitude"],
-                new_point["longitude"],
-            )
-
-            # Ignore small GPS fluctuations under 2.5 metres.
-            if distance_meters < 2.5:
-                return journey
-
-            incremental_km = distance_meters / 1000.0
-
-            journey["total_distance_km"] = round(
-                float(journey.get("total_distance_km", 0.0))
-                + incremental_km,
-                3,
-            )
-
-        route.append(new_point)
-
-        journey["route_coordinates"] = route
-        journey["points_count"] = len(route)
-        journey["updated_at"] = timestamp
-
-        # Update journey duration.
-        try:
-            start_time = datetime.fromisoformat(
-                journey["start_time"].replace("Z", "+00:00")
-            )
-
-            current_time = datetime.fromisoformat(
-                timestamp.replace("Z", "+00:00")
-            )
-
-            duration = max(
-                0, (current_time - start_time).total_seconds()
-            )
-
-            journey["duration_seconds"] = int(duration)
-            journey["duration_formatted"] = format_duration(duration)
-
-        except (ValueError, TypeError, KeyError):
-            pass
-
-        firestore_service.save_journey(journey)
-
-        app_logger.info(
-            f"[JOURNEY POINT] Device {device_id}: "
-            f"Points={journey['points_count']}, "
-            f"Distance={journey['total_distance_km']} km"
-        )
-
-        return journey
-
-    def end_journey(
-        self,
-        device_id: str,
-        journey_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Complete an active journey and save its final details."""
-
-        if journey_id:
-            journey = firestore_service.get_journey(journey_id)
-            if journey and journey.get("device_id") != device_id:
-                app_logger.warning(
-                    f"[JOURNEY END] Journey {journey_id} does not belong to device {device_id}"
+        pt_dt = parse_iso_timestamp(timestamp)
+        if not pt_dt:
+            try:
+                pt_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except Exception:
+                gps_logger.warning(
+                    f"[JOURNEY REJECTED] Unparseable timestamp for {device_id}: {timestamp}"
                 )
                 return None
-        else:
-            journey = self.get_active_journey(device_id)
 
-        if not journey or journey.get("status") != "ACTIVE":
-            app_logger.warning(
-                f"[JOURNEY END] No active journey found for {device_id}"
+        if pt_dt.tzinfo is None:
+            pt_dt = pt_dt.replace(tzinfo=timezone.utc)
+
+        now_dt = datetime.now(timezone.utc)
+        # Reject future timestamps beyond 10 minutes
+        if (pt_dt - now_dt).total_seconds() > 600:
+            gps_logger.warning(
+                f"[JOURNEY REJECTED] Future timestamp for {device_id}: {timestamp}"
             )
             return None
 
+        normalized_timestamp = normalize_iso_timestamp(timestamp) or pt_dt.isoformat()
+
+        with self._lock:
+            journey = self.get_active_journey(device_id)
+
+            if journey and journey.get("status") == "ACTIVE":
+                # Check inactivity gap between this point and the last point of the journey
+                route = journey.get("route_coordinates", [])
+                last_time_str = route[-1].get("timestamp") if route else (journey.get("updated_at") or journey.get("start_time"))
+                last_dt = parse_iso_timestamp(last_time_str)
+                if last_dt and pt_dt:
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    gap_seconds = (pt_dt - last_dt).total_seconds()
+                    # Inactivity policy: a positive gap > inactivity_timeout_seconds ends previous journey
+                    if gap_seconds > self.inactivity_timeout_seconds:
+                        app_logger.info(
+                            f"[JOURNEY AUTO-COMPLETE] Inactivity gap of {gap_seconds:.0f}s for {device_id}. "
+                            f"Ending journey {journey.get('journey_id')}"
+                        )
+                        self._complete_journey_locked(device_id, journey)
+                        journey = None
+
+            # Auto-create journey if none is active
+            if not journey or journey.get("status") != "ACTIVE":
+                # Guard against historical / replayed GPS points starting a live active journey
+                # If packet is older than 24 hours from current real time, do not auto-create
+                packet_age_seconds = (now_dt - pt_dt).total_seconds()
+                if packet_age_seconds > 86400:
+                    gps_logger.info(
+                        f"[JOURNEY REJECTED] Historical GPS point for {device_id} "
+                        f"(age {packet_age_seconds:.0f}s); not starting new active journey"
+                    )
+                    return None
+
+                now_iso = current_iso_timestamp()
+                journey_id = f"journey_{device_id}_{int(pt_dt.timestamp())}_{uuid.uuid4().hex[:6]}"
+                first_point = {
+                    "latitude": round(float(latitude), 6),
+                    "longitude": round(float(longitude), 6),
+                    "timestamp": normalized_timestamp,
+                    "speed_kmh": round(float(speed_kmh or 0.0), 1),
+                }
+                journey = {
+                    "journey_id": journey_id,
+                    "id": journey_id,
+                    "device_id": device_id,
+                    "status": "ACTIVE",
+                    "start_time": normalized_timestamp,
+                    "end_time": None,
+                    "start_location": first_point,
+                    "end_location": None,
+                    "route_coordinates": [first_point],
+                    "total_distance_km": 0.0,
+                    "duration_seconds": 0,
+                    "duration_formatted": "00:00:00",
+                    "points_count": 1,
+                    "created_at": now_iso,
+                    "updated_at": normalized_timestamp,
+                }
+                self._active_journeys[device_id] = journey
+                firestore_service.save_journey(journey)
+                self._tag_telemetry_journey(device_id, normalized_timestamp, journey_id)
+
+                app_logger.info(
+                    f"[JOURNEY AUTO-START] Device {device_id} started journey {journey_id} "
+                    f"at ({first_point['latitude']}, {first_point['longitude']})"
+                )
+                return journey
+
+            # Existing active journey: append point and compute metrics
+            new_point = {
+                "latitude": round(float(latitude), 6),
+                "longitude": round(float(longitude), 6),
+                "timestamp": normalized_timestamp,
+                "speed_kmh": round(float(speed_kmh or 0.0), 1),
+            }
+
+            route = journey.setdefault("route_coordinates", [])
+            if not journey.get("start_location"):
+                journey["start_location"] = new_point
+                journey["route_coordinates"] = [new_point]
+                journey["points_count"] = 1
+                journey["updated_at"] = normalized_timestamp
+                self._update_journey_duration(journey, normalized_timestamp)
+                firestore_service.save_journey(journey)
+                self._tag_telemetry_journey(device_id, normalized_timestamp, journey["journey_id"])
+                return journey
+
+            if route:
+                previous_point = route[-1]
+                prev_lat = float(previous_point["latitude"])
+                prev_lon = float(previous_point["longitude"])
+
+                # Check exact coordinate duplicate
+                if (
+                    prev_lat == new_point["latitude"]
+                    and prev_lon == new_point["longitude"]
+                ):
+                    journey["updated_at"] = normalized_timestamp
+                    self._update_journey_duration(journey, normalized_timestamp)
+                    firestore_service.save_journey(journey)
+                    self._tag_telemetry_journey(device_id, normalized_timestamp, journey["journey_id"])
+                    return journey
+
+                distance_meters = gps_service.calculate_distance_meters(
+                    prev_lat,
+                    prev_lon,
+                    new_point["latitude"],
+                    new_point["longitude"],
+                )
+
+                # Filter GPS jitter under 2.5 metres
+                if distance_meters < 2.5:
+                    journey["updated_at"] = normalized_timestamp
+                    self._update_journey_duration(journey, normalized_timestamp)
+                    firestore_service.save_journey(journey)
+                    self._tag_telemetry_journey(device_id, normalized_timestamp, journey["journey_id"])
+                    return journey
+
+                # Speed jump filtering (> 180 km/h)
+                try:
+                    prev_pt_dt = parse_iso_timestamp(previous_point["timestamp"])
+                    if prev_pt_dt:
+                        if prev_pt_dt.tzinfo is None:
+                            prev_pt_dt = prev_pt_dt.replace(tzinfo=timezone.utc)
+                        time_delta_sec = (pt_dt - prev_pt_dt).total_seconds()
+                        if time_delta_sec > 0:
+                            calc_speed_kmh = (distance_meters / time_delta_sec) * 3.6
+                            if calc_speed_kmh > 180.0:
+                                gps_logger.warning(
+                                    f"[JOURNEY REJECTED JUMP] Abnormal speed {calc_speed_kmh:.1f} km/h "
+                                    f"for {device_id} ({distance_meters:.1f}m in {time_delta_sec:.1f}s)"
+                                )
+                                return journey
+                except Exception:
+                    pass
+
+                incremental_km = distance_meters / 1000.0
+                journey["total_distance_km"] = round(
+                    float(journey.get("total_distance_km", 0.0)) + incremental_km,
+                    3,
+                )
+
+            route.append(new_point)
+            journey["route_coordinates"] = route
+            journey["points_count"] = len(route)
+            journey["updated_at"] = normalized_timestamp
+            self._update_journey_duration(journey, normalized_timestamp)
+
+            firestore_service.save_journey(journey)
+            self._tag_telemetry_journey(device_id, normalized_timestamp, journey["journey_id"])
+
+            gps_logger.info(
+                f"[JOURNEY POINT ACCEPTED] Device {device_id} Journey={journey['journey_id']} "
+                f"Points={journey['points_count']} Distance={journey['total_distance_km']} km"
+            )
+            return journey
+
+    def _complete_journey_locked(
+        self, device_id: str, journey: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Internal helper to mark a journey completed and persist it."""
         now_iso = current_iso_timestamp()
         route = journey.get("route_coordinates", [])
-
         end_location = route[-1] if route else None
 
         if not end_location:
             device = firestore_service.get_device(device_id) or {}
-
             candidate = self._get_initial_device_location(device)
-
             if candidate:
                 end_location = candidate
 
@@ -567,59 +435,58 @@ class JourneyService:
         journey["end_time"] = now_iso
         journey["end_location"] = end_location
         journey["updated_at"] = now_iso
-
-        # Calculate final duration.
-        try:
-            start_time = datetime.fromisoformat(
-                journey["start_time"].replace("Z", "+00:00")
-            )
-
-            end_time = datetime.fromisoformat(
-                now_iso.replace("Z", "+00:00")
-            )
-
-            duration = max(
-                0, (end_time - start_time).total_seconds()
-            )
-
-            journey["duration_seconds"] = int(duration)
-            journey["duration_formatted"] = format_duration(duration)
-
-        except (ValueError, TypeError, KeyError):
-            journey["duration_seconds"] = 0
-            journey["duration_formatted"] = "00:00:00"
-
         journey["points_count"] = len(route)
 
-        active_journey = self._active_journeys.get(device_id)
-        if active_journey and active_journey.get("journey_id") == journey.get("journey_id"):
+        self._update_journey_duration(journey, now_iso)
+
+        active = self._active_journeys.get(device_id)
+        if active and active.get("journey_id") == journey.get("journey_id"):
             self._active_journeys.pop(device_id, None)
 
         firestore_service.save_journey(journey)
-
         app_logger.info(
-            f"[JOURNEY END] Device {device_id}: "
+            f"[JOURNEY COMPLETED] Device {device_id}: "
+            f"Journey={journey.get('journey_id')}, "
             f"Distance={journey['total_distance_km']} km, "
             f"Duration={journey['duration_formatted']}, "
             f"Points={len(route)}"
         )
-
         return journey
+
+    def end_journey(
+        self,
+        device_id: str,
+        journey_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Complete an active journey and save its final details. Thread-safe."""
+        with self._lock:
+            if journey_id:
+                journey = firestore_service.get_journey(journey_id)
+                if journey and journey.get("device_id") != device_id:
+                    app_logger.warning(
+                        f"[JOURNEY END] Journey {journey_id} does not belong to device {device_id}"
+                    )
+                    return None
+            else:
+                journey = self.get_active_journey(device_id)
+
+            if not journey or journey.get("status") != "ACTIVE":
+                app_logger.warning(
+                    f"[JOURNEY END] No active journey found for {device_id}"
+                )
+                return None
+
+            return self._complete_journey_locked(device_id, journey)
 
     def get_device_journeys(
         self, device_id: str, limit: int = 50
     ) -> List[Dict[str, Any]]:
         """Get journey history for a device."""
-
-        return firestore_service.get_device_journeys(
-            device_id, limit=limit
-        )
+        return firestore_service.get_device_journeys(device_id, limit=limit)
 
     def get_journey(self, journey_id: str) -> Optional[Dict[str, Any]]:
         """Get journey details by ID."""
-
         return firestore_service.get_journey(journey_id)
 
 
 journey_service = JourneyService()
- 

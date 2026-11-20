@@ -31,8 +31,10 @@ from app.receiver.packet_parser import parse_ud, parse_packet
 from app.services.device_service import device_service
 from app.services.firestore_service import firestore_service
 from app.dashboard.dashboard_service import dashboard_service
+from app.services.alert_service import alert_service
 
 firestore_module = importlib.import_module("app.services.firestore_service")
+alert_module = importlib.import_module("app.services.alert_service")
 
 
 class TestGPSAndFirebaseSync(unittest.TestCase):
@@ -40,11 +42,17 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         self.dev_id = f"TEST_DEVICE_{uuid.uuid4().hex[:8]}"
         self.maker = "MNYD"
         self.temp_dir = tempfile.TemporaryDirectory()
+        test_db = Path(self.temp_dir.name) / "gps-sync-test.db"
         self.db_patcher = patch.object(
-            firestore_module, "LOCAL_DB", Path(self.temp_dir.name) / "gps-sync-test.db"
+            firestore_module, "LOCAL_DB", test_db
         )
         self.db_patcher.start()
+        self.alert_db_patcher = patch.object(
+            alert_module, "LOCAL_DB", test_db
+        )
+        self.alert_db_patcher.start()
         firestore_service._init_local_db()
+        alert_service._ensure_tables()
         with firestore_service._device_cache_lock:
             firestore_service._device_cache.clear()
             firestore_service._devices_cache = None
@@ -52,6 +60,10 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
             firestore_module, "is_firebase_active", return_value=False
         )
         self.firebase_patcher.start()
+        self.alert_firebase_patcher = patch.object(
+            alert_module, "is_firebase_active", return_value=False
+        )
+        self.alert_firebase_patcher.start()
 
         # Mock Firestore client to capture writes and allow fast, reliable unit testing
         self.mock_db = MagicMock()
@@ -98,6 +110,8 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
     def tearDown(self):
         self.firestore_patcher.stop()
         self.firebase_patcher.stop()
+        self.alert_firebase_patcher.stop()
+        self.alert_db_patcher.stop()
         self.db_patcher.stop()
         self.temp_dir.cleanup()
 

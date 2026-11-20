@@ -3,7 +3,7 @@ GPS & Location Tracking API Routes
 Endpoints for live map tracking, historical GPS breadcrumbs, polling, and geofence checking.
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Query, Request
 from pydantic import BaseModel, Field
 from ..services.gps_service import gps_service
@@ -468,10 +468,16 @@ def get_latest_location(device_id: str):
 @router.get("/{device_id}/history", response_model=List[Dict[str, Any]])
 def get_location_history(
     device_id: str,
-    limit: int = Query(50, ge=1, le=500, description="Number of coordinates to return")
+    limit: int = Query(500, ge=1, le=5000, description="Number of coordinates to return"),
+    before_timestamp: Optional[str] = Query(None, description="Cursor: return points before this ISO timestamp"),
+    after_timestamp: Optional[str] = Query(None, description="Cursor: return points after this ISO timestamp"),
+    start_time: Optional[str] = Query(None, description="Filter: start of time window (ISO string)"),
+    end_time: Optional[str] = Query(None, description="Filter: end of time window (ISO string)"),
+    journey_id: Optional[str] = Query(None, description="Filter: specific journey ID"),
 ):
     """
     Retrieve historical GPS breadcrumbs and telemetry trail for route replay on a map.
+    Supports cursor-based pagination and time/journey filtering.
     """
     existing = device_service.get_device_by_id(device_id)
     if not existing:
@@ -479,7 +485,22 @@ def get_location_history(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Device '{device_id}' not found"
         )
-    history = firestore_service.get_telemetry_history(device_id, limit=limit)
+    limit_val = limit if isinstance(limit, int) else 500
+    before_ts_val = before_timestamp if isinstance(before_timestamp, str) and before_timestamp.strip() else None
+    after_ts_val = after_timestamp if isinstance(after_timestamp, str) and after_timestamp.strip() else None
+    start_time_val = start_time if isinstance(start_time, str) and start_time.strip() else None
+    end_time_val = end_time if isinstance(end_time, str) and end_time.strip() else None
+    journey_id_val = journey_id if isinstance(journey_id, str) and journey_id.strip() else None
+
+    history = firestore_service.get_telemetry_history(
+        device_id,
+        limit=limit_val,
+        before_timestamp=before_ts_val,
+        after_timestamp=after_ts_val,
+        start_time=start_time_val,
+        end_time=end_time_val,
+        journey_id=journey_id_val,
+    )
     verified_history = []
     for record in history:
         verified_fix = normalize_verified_gps_fix(

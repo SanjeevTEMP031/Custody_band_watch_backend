@@ -9,7 +9,9 @@ Verifies:
 6. API routes (/api/v1/journeys/start, /end, /active, /device) operate cleanly
 """
 
+import tempfile
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 from app.services.journey_service import journey_service, format_duration
@@ -25,6 +27,22 @@ from app.journeys.journey_routes import (
 
 
 class TestJourneyTracking(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.temp_db_path = Path(cls.temp_dir.name) / "test_custody.db"
+        cls.db_patch1 = patch("app.services.firestore_service.LOCAL_DB", cls.temp_db_path)
+        cls.db_patch2 = patch("app.services.journey_service.LOCAL_DB", cls.temp_db_path)
+        cls.db_patch1.start()
+        cls.db_patch2.start()
+        firestore_service._init_local_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db_patch1.stop()
+        cls.db_patch2.stop()
+        cls.temp_dir.cleanup()
+
     def setUp(self):
         self.device_id = "863758061830955"
 
@@ -246,6 +264,115 @@ class TestJourneyTracking(unittest.TestCase):
         # Active query now returns False
         active_resp_after = get_active_journey(self.device_id)
         self.assertFalse(active_resp_after["active"])
+
+    def test_7_auto_create_journey_on_first_valid_fix(self):
+        """Verifies automatic journey creation on first verified GPS fix when none exists."""
+        journey_service.end_journey(self.device_id)
+        journey_service._active_journeys.clear()
+
+        now_str = datetime.now(timezone.utc).isoformat()
+        lat, lon = 17.447000, 78.369000
+        res = journey_service.record_journey_point(
+            self.device_id,
+            latitude=lat,
+            longitude=lon,
+            timestamp=now_str,
+            speed_kmh=22.5
+        )
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res["status"], "ACTIVE")
+        self.assertEqual(res["points_count"], 1)
+        self.assertIsNotNone(res["start_location"])
+        self.assertAlmostEqual(res["start_location"]["latitude"], lat, places=5)
+        self.assertAlmostEqual(res["start_location"]["longitude"], lon, places=5)
+
+        # Check get_active_journey returns it
+        active = journey_service.get_active_journey(self.device_id)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["journey_id"], res["journey_id"])
+
+    def test_8_continuous_travel_remains_single_journey(self):
+        """Verifies continuous travel across multiple hours remains ONE single persistent journey."""
+        journey_service.end_journey(self.device_id)
+        journey_service._active_journeys.clear()
+
+        base_time = datetime.now(timezone.utc) - timedelta(hours=3)
+        curr_lat, curr_lon = 17.440000, 78.360000
+
+        # Simulate 180 minutes of continuous travel (point every 10 minutes)
+        initial = journey_service.record_journey_point(
+            self.device_id,
+            latitude=curr_lat,
+            longitude=curr_lon,
+            timestamp=base_time.isoformat(),
+            speed_kmh=30.0
+        )
+        self.assertIsNotNone(initial)
+        initial_id = initial["journey_id"]
+
+        for i in range(1, 18):
+            step_time = base_time + timedelta(minutes=i * 10)
+            curr_lat += 0.005
+            curr_lon += 0.005
+            res = journey_service.record_journey_point(
+                self.device_id,
+                latitude=curr_lat,
+                longitude=curr_lon,
+                timestamp=step_time.isoformat(),
+                speed_kmh=35.0
+            )
+            self.assertIsNotNone(res)
+            # Journey ID must remain identical
+            self.assertEqual(res["journey_id"], initial_id)
+            self.assertEqual(res["status"], "ACTIVE")
+
+        final_active = journey_service.get_active_journey(self.device_id)
+        self.assertEqual(final_active["journey_id"], initial_id)
+        self.assertEqual(final_active["points_count"], 18)
+        self.assertGreater(final_active["total_distance_km"], 5.0)
+
+    def test_9_inactivity_timeout_auto_completes_journey(self):
+        """Verifies inactivity > 30 mins auto-completes old journey and starts new one on next fix."""
+        journey_service.end_journey(self.device_id)
+        journey_service._active_journeys.clear()
+
+        t0 = datetime.now(timezone.utc) - timedelta(hours=2)
+        j1 = journey_service.record_journey_point(
+            self.device_id,
+            latitude=17.441000,
+            longitude=78.361000,
+            timestamp=t0.isoformat()
+        )
+        self.assertIsNotNone(j1)
+        j1_id = j1["journey_id"]
+
+        # Next point 35 minutes later (exceeds 30 min inactivity threshold)
+        t1 = t0 + timedelta(minutes=35)
+        j2 = journey_service.record_journey_point(
+            self.device_id,
+            latitude=17.450000,
+            longitude=78.370000,
+            timestamp=t1.isoformat()
+        )
+        self.assertIsNotNone(j2)
+        self.assertNotEqual(j2["journey_id"], j1_id)
+        self.assertEqual(j2["status"], "ACTIVE")
+
+    def test_10_historical_point_does_not_auto_create_active_journey(self):
+        """Verifies historical/replayed points older than 24 hours do not create a new active journey."""
+        journey_service.end_journey(self.device_id)
+        journey_service._active_journeys.clear()
+
+        old_time = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        res = journey_service.record_journey_point(
+            self.device_id,
+            latitude=17.440000,
+            longitude=78.360000,
+            timestamp=old_time
+        )
+        self.assertIsNone(res)
+        self.assertIsNone(journey_service.get_active_journey(self.device_id))
 
 
 if __name__ == "__main__":

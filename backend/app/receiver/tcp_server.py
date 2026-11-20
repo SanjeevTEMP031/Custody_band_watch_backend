@@ -56,14 +56,23 @@ def _close_socket(conn: socket.socket):
 
 
 def _unregister_connection(conn: socket.socket, final: bool = False):
+    removed_devices = []
     with conn_lock:
         _retired_connections.add(conn)
         for device_id, registered_conn in list(active_connections.items()):
             if registered_conn is conn:
                 active_connections.pop(device_id, None)
                 _connection_last_seen.pop(device_id, None)
+                removed_devices.append(device_id)
         write_lock = _connection_write_locks.get(conn)
         _client_connections.discard(conn)
+
+    for dev_id in removed_devices:
+        try:
+            from ..services.alert_service import alert_service
+            alert_service.record_disconnection_event(dev_id)
+        except Exception:
+            pass
 
     if write_lock is not None:
         with write_lock:

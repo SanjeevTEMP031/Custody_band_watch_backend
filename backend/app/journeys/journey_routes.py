@@ -101,9 +101,10 @@ def get_journey_by_id(journey_id: str):
     """
     Retrieves full details of a specific journey including complete polyline route coordinates.
     """
-    journey = journey_service.get_journey(journey_id)
+    clean_id = (journey_id or "").strip()
+    journey = journey_service.get_journey(clean_id)
     if not journey:
-        raise HTTPException(status_code=404, detail=f"Journey {journey_id} not found")
+        raise HTTPException(status_code=404, detail=f"Journey {clean_id} not found")
 
     return journey
 

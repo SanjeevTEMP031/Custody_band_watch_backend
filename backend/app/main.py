@@ -77,6 +77,13 @@ async def lifespan(app: FastAPI):
     start_receiver_background()
     firestore_service.start_firestore_sync_worker()
 
+    import asyncio
+    from .services.alert_service import ws_manager
+    try:
+        ws_manager.set_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
+
     try:
         yield
     finally:

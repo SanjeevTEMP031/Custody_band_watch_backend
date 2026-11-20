@@ -173,6 +173,8 @@ def parse_ud(
 
         # Field 15: Terminal status (Hex 8 digits)
         is_charging = False
+        term_hex = None
+        status_int = 0
         if len(fields) > 15:
             try:
                 term_hex = fields[15].strip()
@@ -263,14 +265,100 @@ def parse_ud(
         if battery is not None:
             alert_service.check_battery_alert(device_id, battery)
 
-        # Check alarm conditions
+        # Communication received: auto-clear offline and communication lost alerts
+        alert_service.resolve_active_alerts_by_type(
+            device_id=device_id,
+            alert_types=["WATCH_OFFLINE", "DEVICE_COMMUNICATION_LOST", "NETWORK_DISCONNECTED"],
+            resolved_by="SYSTEM_TELEMETRY_RECEIVED",
+            notes="Active communication restored"
+        )
+
+        if is_valid_gps:
+            alert_service.resolve_active_alerts_by_type(
+                device_id=device_id,
+                alert_types=["GPS_UNAVAILABLE"],
+                resolved_by="SYSTEM_GPS_RESTORED",
+                notes="Valid GPS fix received"
+            )
+
+        # Check alarm conditions (Never assume AL always means SOS)
         if cmd == "AL":
+            detected_alert_type = None
+            detected_message = None
+
+            if status_int & 0x01:
+                detected_alert_type = "SOS_ALERT"
+                detected_message = "Emergency SOS button triggered by custody subject"
+            elif status_int & 0x40:
+                detected_alert_type = "STRAP_CUT_ALERT"
+                detected_message = "Verified strap-cut sensor event detected on watch band"
+            elif status_int & 0x2000:
+                detected_alert_type = "TAMPER_ALERT"
+                detected_message = "Verified hardware tampering event detected"
+            elif status_int & 0x80:
+                detected_alert_type = "BRACELET_REMOVED"
+                detected_message = "Verified removal event: Watch removed from subject's wrist"
+            elif status_int & 0x1000:
+                detected_alert_type = "BRACELET_DISCONNECTED"
+                detected_message = "Bracelet link disconnected event"
+            elif status_int & 0x20:
+                detected_alert_type = "STRAP_OPENED"
+                detected_message = "Verified strap-open sensor event"
+            elif status_int & 0x100:
+                detected_alert_type = "FALL_ALERT"
+                detected_message = "Verified fall-detection event reported by firmware"
+            elif status_int & 0x200:
+                detected_alert_type = "DEVICE_POWERED_OFF"
+                detected_message = "Explicit device power-off event reported"
+            elif status_int & 0x400:
+                detected_alert_type = "WATCH_INACTIVE"
+                detected_message = "Subject prolonged inactivity sensor event"
+
+            # Check if any later field has an explicit alarm sub-code or text
+            if not detected_alert_type:
+                for f_idx in range(16, min(len(fields), 22)):
+                    f_val = fields[f_idx].strip().upper()
+                    if f_val in ("SOS", "SOS_ALERT"):
+                        detected_alert_type = "SOS_ALERT"
+                        detected_message = "SOS Alarm triggered by wearer"
+                        break
+                    elif f_val in ("CUT", "STRAP_CUT", "STRAP_CUT_ALERT"):
+                        detected_alert_type = "STRAP_CUT_ALERT"
+                        detected_message = "Strap cut sensor event detected"
+                        break
+                    elif f_val in ("REMOVE", "REMOVED", "BRACELET_REMOVED"):
+                        detected_alert_type = "BRACELET_REMOVED"
+                        detected_message = "Bracelet removed event detected"
+                        break
+                    elif f_val in ("TAMPER", "TAMPER_ALERT"):
+                        detected_alert_type = "TAMPER_ALERT"
+                        detected_message = "Tamper event reported"
+                        break
+                    elif f_val in ("OPEN", "STRAP_OPENED"):
+                        detected_alert_type = "STRAP_OPENED"
+                        detected_message = "Strap open event reported"
+                        break
+                    elif f_val in ("FALL", "FALL_ALERT"):
+                        detected_alert_type = "FALL_ALERT"
+                        detected_message = "Fall event detected"
+                        break
+
+            # If still unspecified: Do NOT assume it is SOS! Create TAMPER_ALERT
+            if not detected_alert_type:
+                detected_alert_type = "TAMPER_ALERT"
+                detected_message = f"Watch reported alarm frame (status hex: {term_hex or 'UNKNOWN'})"
+
             alert_service.trigger_alert(
                 device_id=device_id,
-                alert_type="SOS",
-                message="SOS Alarm triggered by wearer",
+                alert_type=detected_alert_type,
+                message=detected_message,
                 latitude=record.get("latitude"),
-                longitude=record.get("longitude")
+                longitude=record.get("longitude"),
+                gps_valid=bool(record.get("gps_valid")),
+                gps_timestamp=record.get("timestamp"),
+                event_time=server_received_at,
+                source="C05_DEVICE",
+                raw_event_code=term_hex or cmd
             )
 
         return record
@@ -353,6 +441,13 @@ def parse_packet(
         if bat is not None:
             alert_service.check_battery_alert(dev_id, bat)
 
+        alert_service.resolve_active_alerts_by_type(
+            device_id=dev_id,
+            alert_types=["WATCH_OFFLINE", "DEVICE_COMMUNICATION_LOST", "NETWORK_DISCONNECTED"],
+            resolved_by="SYSTEM_KEEPALIVE_RECEIVED",
+            notes="Watch keepalive received"
+        )
+
     # 3. Heart Rate
     elif cmd_key == "HEART":
         parts = msg.split(",")
@@ -390,10 +485,111 @@ def parse_packet(
         if bat is not None:
             alert_service.check_battery_alert(dev_id, bat)
 
+        alert_service.resolve_active_alerts_by_type(
+            device_id=dev_id,
+            alert_types=["WATCH_OFFLINE", "DEVICE_COMMUNICATION_LOST", "NETWORK_DISCONNECTED"],
+            resolved_by="SYSTEM_LINK_RECEIVED",
+            notes="Watch link status received"
+        )
+
+    # 5. Bracelet Connection & Tamper Packets
+    elif cmd_key in ("BRACELET", "BT", "BLE"):
+        parts = msg.split(",")
+        state = parts[1].strip().upper() if len(parts) > 1 else ""
+        if state in ("1", "CONNECTED", "CONNECT", "ON"):
+            alert_service.trigger_alert(
+                device_id=dev_id,
+                alert_type="BRACELET_CONNECTED",
+                severity="INFO",
+                message="Bracelet link connection established / restored",
+                event_time=received_at_value,
+                source="C05_DEVICE"
+            )
+            alert_service.resolve_active_alerts_by_type(
+                device_id=dev_id,
+                alert_types=["BRACELET_DISCONNECTED"],
+                resolved_by="SYSTEM_BRACELET_CONNECTED",
+                notes="Bracelet link restored"
+            )
+        else:
+            # Do not assume physically removed or cut
+            alert_service.trigger_alert(
+                device_id=dev_id,
+                alert_type="BRACELET_DISCONNECTED",
+                severity="HIGH",
+                message="Bracelet link disconnected event",
+                event_time=received_at_value,
+                source="C05_DEVICE"
+            )
+
+    elif cmd_key in ("STRAP", "BELT"):
+        parts = msg.split(",")
+        action = parts[1].strip().upper() if len(parts) > 1 else ""
+        if "CUT" in action:
+            alert_service.trigger_alert(
+                device_id=dev_id,
+                alert_type="STRAP_CUT_ALERT",
+                severity="CRITICAL",
+                message="Verified strap-cut sensor event reported",
+                event_time=received_at_value,
+                source="C05_DEVICE"
+            )
+        elif "OPEN" in action:
+            alert_service.trigger_alert(
+                device_id=dev_id,
+                alert_type="STRAP_OPENED",
+                severity="HIGH",
+                message="Verified strap-open sensor event",
+                event_time=received_at_value,
+                source="C05_DEVICE"
+            )
+        elif "LOCK" in action or "CLOSE" in action:
+            alert_service.trigger_alert(
+                device_id=dev_id,
+                alert_type="WATCH_LOCKED",
+                severity="INFO",
+                message="Verified watch locking event",
+                event_time=received_at_value,
+                source="C05_DEVICE"
+            )
+            alert_service.resolve_active_alerts_by_type(
+                device_id=dev_id,
+                alert_types=["STRAP_OPENED"],
+                resolved_by="SYSTEM_WATCH_LOCKED",
+                notes="Watch locked"
+            )
+
+    elif cmd_key in ("POWEROFF", "SHUTDOWN"):
+        # Explicit device power-off event (Do not assume an offline watch was powered off)
+        alert_service.trigger_alert(
+            device_id=dev_id,
+            alert_type="DEVICE_POWERED_OFF",
+            severity="HIGH",
+            message="Explicit device power-off event reported by firmware",
+            event_time=received_at_value,
+            source="C05_DEVICE"
+        )
+
+    elif cmd_key == "FALL":
+        alert_service.trigger_alert(
+            device_id=dev_id,
+            alert_type="FALL_ALERT",
+            severity="HIGH",
+            message="Verified fall-detection event reported by firmware",
+            event_time=received_at_value,
+            source="C05_DEVICE"
+        )
+
     # These manufacturer control commands do not represent a GPS fix.
     elif cmd_key in ("PING", "CR", "TIME", "LGZONE"):
         device_service.update_heartbeat(
             dev_id, None, None, received_at=received_at_value
+        )
+        alert_service.resolve_active_alerts_by_type(
+            device_id=dev_id,
+            alert_types=["WATCH_OFFLINE", "DEVICE_COMMUNICATION_LOST", "NETWORK_DISCONNECTED"],
+            resolved_by="SYSTEM_PING_RECEIVED",
+            notes="Watch ping received"
         )
 
     return cmd_key, reply_bytes
