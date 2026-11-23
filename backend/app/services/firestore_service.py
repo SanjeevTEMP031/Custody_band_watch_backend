@@ -2733,10 +2733,10 @@ class FirestoreService:
 
         sl = journey_data.get("start_location") or {}
         el = journey_data.get("end_location") or {}
-        s_lat = sl.get("latitude")
-        s_lon = sl.get("longitude")
-        e_lat = el.get("latitude")
-        e_lon = el.get("longitude")
+        s_lat = sl.get("latitude") if sl.get("latitude") is not None else journey_data.get("start_latitude")
+        s_lon = sl.get("longitude") if sl.get("longitude") is not None else journey_data.get("start_longitude")
+        e_lat = el.get("latitude") if el.get("latitude") is not None else journey_data.get("end_latitude")
+        e_lon = el.get("longitude") if el.get("longitude") is not None else journey_data.get("end_longitude")
 
         dist_km = float(journey_data.get("total_distance_km", 0.0))
         dur_sec = int(journey_data.get("duration_seconds", 0))
@@ -2800,6 +2800,12 @@ class FirestoreService:
                             "status": status,
                             "start_time": st,
                             "end_time": et,
+                            "start_latitude": s_lat,
+                            "start_longitude": s_lon,
+                            "start_location": sl or ({"latitude": s_lat, "longitude": s_lon, "timestamp": st} if s_lat is not None and s_lon is not None else None),
+                            "end_latitude": e_lat,
+                            "end_longitude": e_lon,
+                            "end_location": el or ({"latitude": e_lat, "longitude": e_lon, "timestamp": et} if e_lat is not None and e_lon is not None else None),
                             "total_distance_km": dist_km,
                             "duration_seconds": dur_sec,
                             "duration_formatted": dur_fmt,

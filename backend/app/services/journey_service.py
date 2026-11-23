@@ -59,7 +59,7 @@ class JourneyService:
             return False
 
     def _get_initial_device_location(
-        self, device: Dict[str, Any]
+        self, device: Dict[str, Any], device_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Read the last known verified GPS location for a journey endpoint."""
         lat = device.get("last_latitude")
@@ -160,11 +160,43 @@ class JourneyService:
         with self._lock:
             existing = self.get_active_journey(device_id)
             if existing and existing.get("status") == "ACTIVE":
-                app_logger.info(
-                    f"[JOURNEY] Device {device_id} already has active "
-                    f"journey {existing.get('journey_id')}"
-                )
-                return existing
+                # Check if this existing journey is stale (> inactivity_timeout_seconds)
+                last_activity = existing.get("updated_at") or existing.get("start_time")
+                last_dt = parse_iso_timestamp(last_activity)
+                now_dt = datetime.now(timezone.utc)
+                if last_dt and (now_dt - last_dt).total_seconds() > self.inactivity_timeout_seconds:
+                    app_logger.info(
+                        f"[JOURNEY] Existing active journey {existing.get('journey_id')} for {device_id} is stale "
+                        f"({(now_dt - last_dt).total_seconds():.0f}s inactive). Auto-completing."
+                    )
+                    self._complete_journey_locked(device_id, existing)
+                    existing = None
+                else:
+                    # If existing journey lacks start_location or start_latitude, attach coordinates now
+                    if not existing.get("start_location") or existing.get("start_latitude") is None:
+                        loc = None
+                        if initial_location and self._valid_coordinates(
+                            initial_location.get("latitude"), initial_location.get("longitude")
+                        ):
+                            loc = {
+                                "latitude": round(float(initial_location["latitude"]), 6),
+                                "longitude": round(float(initial_location["longitude"]), 6),
+                                "timestamp": initial_location.get("timestamp") or current_iso_timestamp(),
+                                "speed_kmh": round(float(initial_location.get("speed_kmh") or 0.0), 1),
+                            }
+                        else:
+                            device = firestore_service.get_device(device_id) or {}
+                            loc = self._get_initial_device_location(device, device_id)
+
+                        if loc:
+                            existing["start_location"] = loc
+                            existing["start_latitude"] = loc["latitude"]
+                            existing["start_longitude"] = loc["longitude"]
+                            if not existing.get("route_coordinates"):
+                                existing["route_coordinates"] = [loc]
+                                existing["points_count"] = 1
+                            firestore_service.save_journey(existing)
+                    return existing
 
             now_iso = current_iso_timestamp()
             st = start_time or now_iso
@@ -182,11 +214,14 @@ class JourneyService:
                 }
             else:
                 device = firestore_service.get_device(device_id) or {}
-                start_location = self._get_initial_device_location(device)
+                start_location = self._get_initial_device_location(device, device_id)
 
             route_coordinates: List[Dict[str, Any]] = []
             if start_location:
                 route_coordinates.append(start_location)
+
+            start_lat = start_location.get("latitude") if start_location else None
+            start_lon = start_location.get("longitude") if start_location else None
 
             journey: Dict[str, Any] = {
                 "journey_id": journey_id,
@@ -196,7 +231,11 @@ class JourneyService:
                 "start_time": st,
                 "end_time": None,
                 "start_location": start_location,
+                "start_latitude": start_lat,
+                "start_longitude": start_lon,
                 "end_location": None,
+                "end_latitude": None,
+                "end_longitude": None,
                 "route_coordinates": route_coordinates,
                 "total_distance_km": 0.0,
                 "duration_seconds": 0,
@@ -309,7 +348,11 @@ class JourneyService:
                     "start_time": normalized_timestamp,
                     "end_time": None,
                     "start_location": first_point,
+                    "start_latitude": first_point["latitude"],
+                    "start_longitude": first_point["longitude"],
                     "end_location": None,
+                    "end_latitude": None,
+                    "end_longitude": None,
                     "route_coordinates": [first_point],
                     "total_distance_km": 0.0,
                     "duration_seconds": 0,
@@ -337,8 +380,10 @@ class JourneyService:
             }
 
             route = journey.setdefault("route_coordinates", [])
-            if not journey.get("start_location"):
+            if not journey.get("start_location") or journey.get("start_latitude") is None:
                 journey["start_location"] = new_point
+                journey["start_latitude"] = new_point["latitude"]
+                journey["start_longitude"] = new_point["longitude"]
                 journey["route_coordinates"] = [new_point]
                 journey["points_count"] = 1
                 journey["updated_at"] = normalized_timestamp
@@ -427,13 +472,19 @@ class JourneyService:
 
         if not end_location:
             device = firestore_service.get_device(device_id) or {}
-            candidate = self._get_initial_device_location(device)
+            candidate = self._get_initial_device_location(device, device_id)
             if candidate:
                 end_location = candidate
 
         journey["status"] = "COMPLETED"
         journey["end_time"] = now_iso
         journey["end_location"] = end_location
+        if end_location:
+            journey["end_latitude"] = end_location.get("latitude")
+            journey["end_longitude"] = end_location.get("longitude")
+        if journey.get("start_location"):
+            journey["start_latitude"] = journey["start_location"].get("latitude")
+            journey["start_longitude"] = journey["start_location"].get("longitude")
         journey["updated_at"] = now_iso
         journey["points_count"] = len(route)
 

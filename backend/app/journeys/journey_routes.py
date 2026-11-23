@@ -15,6 +15,12 @@ router = APIRouter(prefix="/journeys", tags=["Journeys & Travel Tracking"])
 
 class StartJourneyRequest(BaseModel):
     device_id: str = Field(..., description="IMEI or ID of the custody band device", example="863758061830955")
+    start_latitude: Optional[float] = Field(None, description="Starting latitude")
+    start_longitude: Optional[float] = Field(None, description="Starting longitude")
+    latitude: Optional[float] = Field(None, description="Alias for start_latitude")
+    longitude: Optional[float] = Field(None, description="Alias for start_longitude")
+    wearer_name: Optional[str] = Field(None, description="Optional wearer name")
+    timestamp: Optional[str] = Field(None, description="Optional start timestamp")
 
 
 class EndJourneyRequest(BaseModel):
@@ -32,7 +38,22 @@ def start_journey(request: StartJourneyRequest):
     if not dev_id:
         raise HTTPException(status_code=400, detail="device_id is required")
 
-    journey = journey_service.start_journey(dev_id)
+    lat = request.start_latitude if request.start_latitude is not None else request.latitude
+    lon = request.start_longitude if request.start_longitude is not None else request.longitude
+    initial_location = None
+    if lat is not None and lon is not None:
+        initial_location = {
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "timestamp": request.timestamp or None,
+            "speed_kmh": 0.0,
+        }
+
+    journey = journey_service.start_journey(
+        dev_id,
+        start_time=request.timestamp,
+        initial_location=initial_location,
+    )
     return {
         "success": True,
         "message": "Journey started successfully",

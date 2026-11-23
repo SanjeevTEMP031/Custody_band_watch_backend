@@ -374,6 +374,26 @@ class TestJourneyTracking(unittest.TestCase):
         self.assertIsNone(res)
         self.assertIsNone(journey_service.get_active_journey(self.device_id))
 
+    def test_11_start_journey_route_accepts_and_captures_coordinates(self):
+        """Verifies start_journey endpoint captures start_latitude and start_longitude when provided."""
+        journey_service.end_journey(self.device_id)
+        journey_service._active_journeys.clear()
+
+        req = StartJourneyRequest(
+            device_id=self.device_id,
+            start_latitude=17.444050,
+            start_longitude=78.385460,
+        )
+        res = start_journey(req)
+        self.assertTrue(res["success"])
+        journey = res["journey"]
+        self.assertEqual(journey["start_latitude"], 17.44405)
+        self.assertEqual(journey["start_longitude"], 78.38546)
+        self.assertIsNotNone(journey["start_location"])
+        self.assertEqual(journey["start_location"]["latitude"], 17.44405)
+        self.assertEqual(journey["start_location"]["longitude"], 78.38546)
+        self.assertEqual(len(journey["route_coordinates"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
