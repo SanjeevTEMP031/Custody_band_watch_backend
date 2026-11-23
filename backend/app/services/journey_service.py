@@ -35,11 +35,11 @@ def format_duration(seconds: float) -> str:
 
 class JourneyService:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._active_journeys: Dict[str, Dict[str, Any]] = {}
-        # Inactivity timeout: 30 minutes (1800s) default
+        # Inactivity timeout: 10 minutes (600s) default
         self.inactivity_timeout_seconds: float = float(
-            getattr(settings, "JOURNEY_INACTIVITY_TIMEOUT_SECONDS", 1800)
+            getattr(settings, "JOURNEY_INACTIVITY_TIMEOUT_SECONDS", 600)
         )
 
     @staticmethod
@@ -134,18 +134,54 @@ class JourneyService:
         except Exception:
             pass
 
+    def _is_journey_timed_out(
+        self, journey: Dict[str, Any], current_dt: Optional[datetime] = None
+    ) -> bool:
+        """Check if an active journey has exceeded the inactivity timeout."""
+        if not journey or journey.get("status") != "ACTIVE":
+            return False
+
+        last_time_str = None
+        route = journey.get("route_coordinates", [])
+        if route:
+            last_time_str = route[-1].get("timestamp")
+        if not last_time_str:
+            last_time_str = journey.get("updated_at") or journey.get("start_time")
+
+        last_dt = parse_iso_timestamp(last_time_str) if last_time_str else None
+        if not last_dt:
+            return False
+
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+
+        ref_dt = current_dt or datetime.now(timezone.utc)
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+
+        return (ref_dt - last_dt).total_seconds() > self.inactivity_timeout_seconds
+
     def get_active_journey(self, device_id: str) -> Optional[Dict[str, Any]]:
-        """Get an active journey from memory, SQLite, or Firestore."""
-        journey = self._active_journeys.get(device_id)
-        if journey and journey.get("status") == "ACTIVE":
+        """Get an active journey from memory, SQLite, or Firestore, auto-completing if timed out."""
+        with self._lock:
+            journey = self._active_journeys.get(device_id)
+            if not journey or journey.get("status") != "ACTIVE":
+                persisted = firestore_service.get_active_journey(device_id)
+                if persisted and persisted.get("status") == "ACTIVE":
+                    journey = persisted
+                    self._active_journeys[device_id] = persisted
+                else:
+                    return None
+
+            if journey.get("status") != "ACTIVE" or self._is_journey_timed_out(journey):
+                app_logger.info(
+                    f"[JOURNEY AUTO-COMPLETE] Active journey {journey.get('journey_id')} for {device_id} "
+                    f"inactive > {self.inactivity_timeout_seconds}s or marked non-active. Marking COMPLETED."
+                )
+                self._complete_journey_locked(device_id, journey)
+                return None
+
             return journey
-
-        persisted = firestore_service.get_active_journey(device_id)
-        if persisted and persisted.get("status") == "ACTIVE":
-            self._active_journeys[device_id] = persisted
-            return persisted
-
-        return None
 
     def start_journey(
         self,
@@ -303,22 +339,13 @@ class JourneyService:
             journey = self.get_active_journey(device_id)
 
             if journey and journey.get("status") == "ACTIVE":
-                # Check inactivity gap between this point and the last point of the journey
-                route = journey.get("route_coordinates", [])
-                last_time_str = route[-1].get("timestamp") if route else (journey.get("updated_at") or journey.get("start_time"))
-                last_dt = parse_iso_timestamp(last_time_str)
-                if last_dt and pt_dt:
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    gap_seconds = (pt_dt - last_dt).total_seconds()
-                    # Inactivity policy: a positive gap > inactivity_timeout_seconds ends previous journey
-                    if gap_seconds > self.inactivity_timeout_seconds:
-                        app_logger.info(
-                            f"[JOURNEY AUTO-COMPLETE] Inactivity gap of {gap_seconds:.0f}s for {device_id}. "
-                            f"Ending journey {journey.get('journey_id')}"
-                        )
-                        self._complete_journey_locked(device_id, journey)
-                        journey = None
+                if self._is_journey_timed_out(journey, current_dt=pt_dt):
+                    app_logger.info(
+                        f"[JOURNEY AUTO-COMPLETE] Inactivity gap detected for {device_id}. "
+                        f"Ending journey {journey.get('journey_id')}"
+                    )
+                    self._complete_journey_locked(device_id, journey)
+                    journey = None
 
             # Auto-create journey if none is active
             if not journey or journey.get("status") != "ACTIVE":
@@ -463,10 +490,12 @@ class JourneyService:
             return journey
 
     def _complete_journey_locked(
-        self, device_id: str, journey: Dict[str, Any]
+        self,
+        device_id: str,
+        journey: Dict[str, Any],
+        end_time_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Internal helper to mark a journey completed and persist it."""
-        now_iso = current_iso_timestamp()
         route = journey.get("route_coordinates", [])
         end_location = route[-1] if route else None
 
@@ -476,8 +505,11 @@ class JourneyService:
             if candidate:
                 end_location = candidate
 
+        last_fix_time = end_location.get("timestamp") if end_location else None
+        completed_time = end_time_override or last_fix_time or current_iso_timestamp()
+
         journey["status"] = "COMPLETED"
-        journey["end_time"] = now_iso
+        journey["end_time"] = completed_time
         journey["end_location"] = end_location
         if end_location:
             journey["end_latitude"] = end_location.get("latitude")
@@ -485,10 +517,10 @@ class JourneyService:
         if journey.get("start_location"):
             journey["start_latitude"] = journey["start_location"].get("latitude")
             journey["start_longitude"] = journey["start_location"].get("longitude")
-        journey["updated_at"] = now_iso
+        journey["updated_at"] = completed_time
         journey["points_count"] = len(route)
 
-        self._update_journey_duration(journey, now_iso)
+        self._update_journey_duration(journey, completed_time)
 
         active = self._active_journeys.get(device_id)
         if active and active.get("journey_id") == journey.get("journey_id"):
@@ -498,8 +530,8 @@ class JourneyService:
         app_logger.info(
             f"[JOURNEY COMPLETED] Device {device_id}: "
             f"Journey={journey.get('journey_id')}, "
-            f"Distance={journey['total_distance_km']} km, "
-            f"Duration={journey['duration_formatted']}, "
+            f"Distance={journey.get('total_distance_km', 0.0)} km, "
+            f"Duration={journey.get('duration_formatted', '00:00:00')}, "
             f"Points={len(route)}"
         )
         return journey
@@ -527,12 +559,218 @@ class JourneyService:
                 )
                 return None
 
-            return self._complete_journey_locked(device_id, journey)
+            now_iso = current_iso_timestamp()
+            return self._complete_journey_locked(device_id, journey, end_time_override=now_iso)
+
+    def process_unassigned_telemetry(self, device_id: Optional[str] = None) -> int:
+        """
+        Processes unassigned telemetry points (journey_id is NULL) into persistent journeys.
+        Automatically segments continuous travel using inactivity_timeout_seconds,
+        accumulates Haversine distance and duration, saves journeys into SQLite and Firestore,
+        and tags each telemetry row with its assigned journey_id.
+        """
+        with self._lock:
+            try:
+                conn = sqlite3.connect(str(LOCAL_DB))
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+
+                query = """
+                    SELECT id, device_id, timestamp, latitude, longitude, speed_kmh
+                    FROM telemetry
+                    WHERE (journey_id IS NULL OR TRIM(journey_id) = '')
+                      AND gps_valid = 1
+                      AND latitude BETWEEN -90 AND 90
+                      AND longitude BETWEEN -180 AND 180
+                      AND NOT (latitude = 0 AND longitude = 0)
+                """
+                params = []
+                if device_id:
+                    query += " AND device_id = ?"
+                    params.append(str(device_id))
+                query += " ORDER BY device_id, julianday(timestamp) ASC, id ASC"
+
+                rows = cur.execute(query, params).fetchall()
+                conn.close()
+            except Exception as e:
+                app_logger.error(f"[JOURNEY] Error querying unassigned telemetry: {e}")
+                return 0
+
+            if not rows:
+                return 0
+
+            # Group rows by device_id
+            devices_map: Dict[str, List[sqlite3.Row]] = {}
+            for r in rows:
+                devices_map.setdefault(r["device_id"], []).append(r)
+
+            created_count = 0
+            now_dt = datetime.now(timezone.utc)
+            now_iso = current_iso_timestamp()
+
+            for dev_id, dev_rows in devices_map.items():
+                groups: List[List[sqlite3.Row]] = []
+                current_group: List[sqlite3.Row] = []
+                prev_time: Optional[datetime] = None
+
+                for r in dev_rows:
+                    dt = parse_iso_timestamp(r["timestamp"])
+                    if not dt:
+                        continue
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+
+                    if prev_time and (dt - prev_time).total_seconds() > self.inactivity_timeout_seconds:
+                        if current_group:
+                            groups.append(current_group)
+                        current_group = [r]
+                    else:
+                        current_group.append(r)
+                    prev_time = dt
+
+                if current_group:
+                    groups.append(current_group)
+
+                for group in groups:
+                    if not group:
+                        continue
+
+                    # Filter coordinates and calculate distance
+                    route_coords: List[Dict[str, Any]] = []
+                    total_dist_km = 0.0
+                    tagged_ids: List[int] = []
+
+                    for pt in group:
+                        tagged_ids.append(pt["id"])
+                        lat = round(float(pt["latitude"]), 6)
+                        lon = round(float(pt["longitude"]), 6)
+                        ts = normalize_iso_timestamp(pt["timestamp"]) or pt["timestamp"]
+                        spd = round(float(pt["speed_kmh"] or 0.0), 1)
+
+                        pt_obj = {
+                            "latitude": lat,
+                            "longitude": lon,
+                            "timestamp": ts,
+                            "speed_kmh": spd,
+                        }
+
+                        if not route_coords:
+                            route_coords.append(pt_obj)
+                            continue
+
+                        prev_pt = route_coords[-1]
+                        dist_m = gps_service.calculate_distance_meters(
+                            prev_pt["latitude"], prev_pt["longitude"], lat, lon
+                        )
+
+                        # Filter exact duplicate
+                        if prev_pt["latitude"] == lat and prev_pt["longitude"] == lon:
+                            continue
+
+                        # Filter micro-jitter (< 2.5m)
+                        if dist_m < 2.5:
+                            continue
+
+                        # Filter speed jump (> 180 km/h)
+                        try:
+                            t_prev = parse_iso_timestamp(prev_pt["timestamp"])
+                            t_curr = parse_iso_timestamp(ts)
+                            if t_prev and t_curr:
+                                if t_prev.tzinfo is None:
+                                    t_prev = t_prev.replace(tzinfo=timezone.utc)
+                                if t_curr.tzinfo is None:
+                                    t_curr = t_curr.replace(tzinfo=timezone.utc)
+                                dt_s = (t_curr - t_prev).total_seconds()
+                                if dt_s > 0 and (dist_m / dt_s) * 3.6 > 180.0:
+                                    continue
+                        except Exception:
+                            pass
+
+                        route_coords.append(pt_obj)
+                        total_dist_km += dist_m / 1000.0
+
+                    if not route_coords:
+                        continue
+
+                    start_pt = route_coords[0]
+                    end_pt = route_coords[-1]
+                    st_time = start_pt["timestamp"]
+                    et_time = end_pt["timestamp"]
+
+                    st_dt = parse_iso_timestamp(st_time)
+                    et_dt = parse_iso_timestamp(et_time)
+                    if st_dt and st_dt.tzinfo is None:
+                        st_dt = st_dt.replace(tzinfo=timezone.utc)
+                    if et_dt and et_dt.tzinfo is None:
+                        et_dt = et_dt.replace(tzinfo=timezone.utc)
+
+                    dur_seconds = max(0, int((et_dt - st_dt).total_seconds())) if st_dt and et_dt else 0
+                    dur_fmt = format_duration(dur_seconds)
+
+                    # Determine journey status
+                    is_active = et_dt and (now_dt - et_dt).total_seconds() <= self.inactivity_timeout_seconds
+                    status = "ACTIVE" if is_active else "COMPLETED"
+
+                    # Generate clean journey ID based on start time
+                    st_tag = st_dt.strftime("%Y%m%d_%H%M%S") if st_dt else uuid.uuid4().hex[:12]
+                    journey_id = f"journey_{dev_id}_{st_tag}"
+
+                    journey = {
+                        "journey_id": journey_id,
+                        "id": journey_id,
+                        "device_id": dev_id,
+                        "status": status,
+                        "start_time": st_time,
+                        "end_time": et_time if not is_active else None,
+                        "start_location": start_pt,
+                        "start_latitude": start_pt["latitude"],
+                        "start_longitude": start_pt["longitude"],
+                        "end_location": end_pt if not is_active else None,
+                        "end_latitude": end_pt["latitude"] if not is_active else None,
+                        "end_longitude": end_pt["longitude"] if not is_active else None,
+                        "route_coordinates": route_coords,
+                        "total_distance_km": round(total_dist_km, 3),
+                        "duration_seconds": dur_seconds,
+                        "duration_formatted": dur_fmt,
+                        "points_count": len(route_coords),
+                        "created_at": st_time,
+                        "updated_at": et_time or now_iso,
+                    }
+
+                    if is_active:
+                        self._active_journeys[dev_id] = journey
+
+                    firestore_service.save_journey(journey)
+
+                    # Tag telemetry rows in SQLite
+                    try:
+                        conn = sqlite3.connect(str(LOCAL_DB))
+                        for i in range(0, len(tagged_ids), 500):
+                            chunk = tagged_ids[i:i + 500]
+                            placeholders = ",".join("?" for _ in chunk)
+                            conn.execute(
+                                f"UPDATE telemetry SET journey_id = ? WHERE id IN ({placeholders})",
+                                [journey_id] + chunk,
+                            )
+                        conn.commit()
+                        conn.close()
+                    except Exception as exc:
+                        app_logger.error(f"[JOURNEY] Error tagging telemetry chunk: {exc}")
+
+                    app_logger.info(
+                        f"[JOURNEY CREATED] Created {status} journey {journey_id} for {dev_id}: "
+                        f"dist={journey['total_distance_km']} km, pts={journey['points_count']}, "
+                        f"start={st_time}, end={et_time}"
+                    )
+                    created_count += 1
+
+            return created_count
 
     def get_device_journeys(
         self, device_id: str, limit: int = 50
     ) -> List[Dict[str, Any]]:
-        """Get journey history for a device."""
+        """Get journey history for a device, processing any pending untagged telemetry first."""
+        self.process_unassigned_telemetry(device_id)
         return firestore_service.get_device_journeys(device_id, limit=limit)
 
     def get_journey(self, journey_id: str) -> Optional[Dict[str, Any]]:

@@ -38,6 +38,10 @@ def start_journey(request: StartJourneyRequest):
     if not dev_id:
         raise HTTPException(status_code=400, detail="device_id is required")
 
+    req_ts = request.timestamp
+    if req_ts and (req_ts == "string" or not req_ts.strip()):
+        req_ts = None
+
     lat = request.start_latitude if request.start_latitude is not None else request.latitude
     lon = request.start_longitude if request.start_longitude is not None else request.longitude
     initial_location = None
@@ -45,13 +49,13 @@ def start_journey(request: StartJourneyRequest):
         initial_location = {
             "latitude": float(lat),
             "longitude": float(lon),
-            "timestamp": request.timestamp or None,
+            "timestamp": req_ts,
             "speed_kmh": 0.0,
         }
 
     journey = journey_service.start_journey(
         dev_id,
-        start_time=request.timestamp,
+        start_time=req_ts,
         initial_location=initial_location,
     )
     return {

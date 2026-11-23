@@ -2356,6 +2356,12 @@ class FirestoreService:
                             skipped_count,
                             inserted_count
                         )
+                        if inserted_count > 0:
+                            try:
+                                from .journey_service import journey_service
+                                journey_service.process_unassigned_telemetry(device_id)
+                            except Exception as exc:
+                                app_logger.debug(f"[JOURNEY] Post-sync journey processing error: {exc}")
                     except Exception as e:
                         err_str = str(e)
                         is_index_error = "The query requires an index" in err_str or "requires an index" in err_str or "FailedPrecondition" in type(e).__name__
