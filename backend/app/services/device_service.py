@@ -162,8 +162,17 @@ class DeviceService:
             lat,
             lon,
             gps_time,
+            gps_source,
+            max_age_seconds=None
+        )
+        current_fix = normalize_verified_gps_fix(
+            gps_valid,
+            lat,
+            lon,
+            gps_time,
             gps_source
         )
+        is_current = current_fix is not None
         position = verified_fix[:2] if verified_fix else None
         if verified_fix is not None:
             gps_time = verified_fix[2]
@@ -175,8 +184,8 @@ class DeviceService:
         if new_valid_fix and position is not None:
             last_lat, last_lon = position
             last_gps_time = gps_time
-            gps_status = "GPS Locked"
-            is_fix = True
+            gps_status = "GPS Locked" if is_current else "Location Stale"
+            is_fix = is_current
         else:
             last_fix = parse_iso_timestamp(last_gps_time)
             is_stale = (
@@ -261,6 +270,8 @@ class DeviceService:
             update_data["last_valid_gps_time"] = last_gps_time
         if new_valid_fix and verified_fix is not None:
             update_data["gps_source"] = verified_fix[3]
+        elif existing.get("gps_source"):
+            update_data["gps_source"] = existing.get("gps_source")
 
         if dev_battery is not None:
             update_data["battery"] = dev_battery
@@ -271,11 +282,13 @@ class DeviceService:
         if dev_steps is not None:
             update_data["steps"] = dev_steps
 
-        if not firestore_service.save_device(update_data, sync_firestore=False):
+        persisted = firestore_service.save_device(update_data, sync_firestore=False)
+        if not persisted:
             app_logger.error(
                 "[DEVICE STATUS] %s GPS update persistence failed",
                 device_id
             )
+        return persisted
 
     def get_all_devices(self) -> List[Dict[str, Any]]:
         return [
@@ -286,6 +299,9 @@ class DeviceService:
     def get_device_by_id(self, device_id: str) -> Optional[Dict[str, Any]]:
         device = firestore_service.get_device(device_id)
         return self._add_connection_status(device) if device else None
+
+    def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        return self.get_device_by_id(device_id)
 
     @staticmethod
     def _add_connection_status(device: Dict[str, Any]) -> Dict[str, Any]:

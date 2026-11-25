@@ -12,9 +12,9 @@ from ..receiver.tcp_server import get_active_clients_count, send_command_to_devi
 
 class DashboardService:
     def get_summary_stats(self) -> Dict[str, Any]:
-        """Calculates dashboard summary metrics."""
-        devices = device_service.get_all_devices()
-        alerts = alert_service.get_recent_alerts(limit=50)
+        """Calculates dashboard summary metrics with strict device and alert deduplication."""
+        devices = self.list_all_devices()
+        alerts = self.get_recent_alerts(limit=100)
 
         total_devices = len(devices)
         online_devices = sum(1 for d in devices if d.get("online") or d.get("status") == "ONLINE")
@@ -82,7 +82,16 @@ class DashboardService:
         }
 
     def list_all_devices(self) -> List[Dict[str, Any]]:
-        return device_service.get_all_devices()
+        raw_devices = device_service.get_all_devices()
+        seen = set()
+        deduped = []
+        for d in raw_devices:
+            dev_id = str(d.get("device_id") or d.get("id") or "").strip()
+            if not dev_id or dev_id in seen:
+                continue
+            seen.add(dev_id)
+            deduped.append(d)
+        return deduped
 
     def get_device_detail(self, device_id: str) -> Dict[str, Any]:
         dev = device_service.get_device_by_id(device_id)
@@ -98,7 +107,21 @@ class DashboardService:
         return firestore_service.get_telemetry_history(device_id, limit=limit)
 
     def get_recent_alerts(self, limit: int = 20) -> List[Dict[str, Any]]:
-        return alert_service.get_recent_alerts(limit=limit)
+        raw_alerts = alert_service.get_recent_alerts(limit=limit * 2)
+        seen = set()
+        deduped = []
+        for a in raw_alerts:
+            aid = str(a.get("alert_id") or a.get("id") or "").strip()
+            dev_id = str(a.get("device_id") or "").strip()
+            atype = str(a.get("alert_type") or "").strip()
+            sig = aid or f"{dev_id}_{atype}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            deduped.append(a)
+            if len(deduped) >= limit:
+                break
+        return deduped
 
     def dispatch_command(self, device_id: str, command: str) -> Dict[str, Any]:
         success = send_command_to_device(device_id, command)

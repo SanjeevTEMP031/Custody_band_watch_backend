@@ -15,6 +15,7 @@ from ..config import settings
 from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import app_logger, gps_logger
 from .firestore_service import (
+    GPS_FIX_MAX_AGE_SECONDS,
     firestore_service,
     normalize_verified_gps_fix,
     normalize_iso_timestamp,
@@ -172,6 +173,17 @@ class JourneyService:
                     self._active_journeys[device_id] = persisted
                 else:
                     return None
+
+            if journey.get("selected_route_id"):
+                # Approved-route journeys are started and completed by officers, never by
+                # the inactivity timer; re-read the status so an officer's completion is seen.
+                from ..journeys.models import get_journey_by_id
+
+                fresh = get_journey_by_id(str(journey.get("journey_id")))
+                if not fresh or str(fresh.get("status") or "").upper() != "ACTIVE":
+                    self._active_journeys.pop(device_id, None)
+                    return None
+                return journey
 
             if journey.get("status") != "ACTIVE" or self._is_journey_timed_out(journey):
                 app_logger.info(
@@ -334,6 +346,13 @@ class JourneyService:
             return None
 
         normalized_timestamp = normalize_iso_timestamp(timestamp) or pt_dt.isoformat()
+
+        # Approved-route journeys are recorded by the route monitor (dispatched by
+        # gps_service right after this call); never shadow them with an automatic journey.
+        route_journey = self._route_journey_for_point(device_id, normalized_timestamp)
+        if route_journey is not None:
+            self._tag_telemetry_journey(device_id, normalized_timestamp, route_journey["journey_id"])
+            return None
 
         with self._lock:
             journey = self.get_active_journey(device_id)
@@ -562,6 +581,98 @@ class JourneyService:
             now_iso = current_iso_timestamp()
             return self._complete_journey_locked(device_id, journey, end_time_override=now_iso)
 
+    @staticmethod
+    def _route_journey_for_point(device_id: str, timestamp: Any) -> Optional[Dict[str, Any]]:
+        """Approved-route journey covering this GPS time, if any (route monitor owns it)."""
+        from ..journeys.models import get_route_journey_for_timestamp
+
+        try:
+            return get_route_journey_for_timestamp(device_id, timestamp)
+        except Exception as exc:
+            app_logger.warning(
+                "[JOURNEY] Route journey lookup failed device=%s exception=%s", device_id, exc
+            )
+            return None
+
+    @staticmethod
+    def _evaluate_geofences_for_synced_rows(rows: List[sqlite3.Row]) -> None:
+        """
+        Geofence-evaluates Firestore-synced fixes in timestamp order. Fixes older than
+        GPS_FIX_MAX_AGE_SECONDS are rejected by the evaluator, so backfilled history
+        never raises entry/exit alerts as if it were current.
+        """
+        from ..geofencing.evaluator import evaluate_geofence
+
+        now_dt = datetime.now(timezone.utc)
+        for row in rows:
+            point_dt = parse_iso_timestamp(row["timestamp"])
+            if point_dt is None or (now_dt - point_dt).total_seconds() > GPS_FIX_MAX_AGE_SECONDS:
+                continue
+            try:
+                evaluate_geofence(
+                    device_id=row["device_id"],
+                    latitude=float(row["latitude"]),
+                    longitude=float(row["longitude"]),
+                    timestamp=normalize_iso_timestamp(row["timestamp"]) or row["timestamp"],
+                    max_age_seconds=GPS_FIX_MAX_AGE_SECONDS,
+                )
+            except Exception as exc:
+                app_logger.warning(
+                    "[GEOFENCE] Synced point evaluation failed device=%s exception=%s",
+                    row["device_id"], exc,
+                )
+
+    def _assign_rows_to_route_journeys(self, rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+        """
+        Sends verified telemetry rows that fall inside an approved-route journey to the
+        route monitor (in timestamp order) and tags them with that journey. Returns the
+        rows that are not covered by any route journey.
+        """
+        from ..journeys.route_monitor import route_monitor
+
+        remaining: List[sqlite3.Row] = []
+        assigned: Dict[str, List[int]] = {}
+        for row in rows:
+            journey = self._route_journey_for_point(row["device_id"], row["timestamp"])
+            if journey is None:
+                remaining.append(row)
+                continue
+            journey_id = journey["journey_id"]
+            assigned.setdefault(journey_id, []).append(row["id"])
+            try:
+                route_monitor.ingest_synced_point(
+                    journey,
+                    float(row["latitude"]),
+                    float(row["longitude"]),
+                    normalize_iso_timestamp(row["timestamp"]) or row["timestamp"],
+                    float(row["speed_kmh"] or 0.0),
+                )
+            except Exception as exc:
+                app_logger.warning(
+                    "[JOURNEY] Route monitoring of synced point failed journey=%s exception=%s",
+                    journey_id, exc,
+                )
+
+        if assigned:
+            try:
+                conn = sqlite3.connect(str(LOCAL_DB))
+                for journey_id, ids in assigned.items():
+                    for i in range(0, len(ids), 500):
+                        chunk = ids[i:i + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        conn.execute(
+                            f"UPDATE telemetry SET journey_id = ? WHERE id IN ({placeholders})",
+                            [journey_id] + chunk,
+                        )
+                    app_logger.info(
+                        f"[JOURNEY] {len(ids)} synced GPS point(s) assigned to route journey {journey_id}"
+                    )
+                conn.commit()
+                conn.close()
+            except Exception as exc:
+                app_logger.error(f"[JOURNEY] Error tagging route journey telemetry: {exc}")
+        return remaining
+
     def process_unassigned_telemetry(self, device_id: Optional[str] = None) -> int:
         """
         Processes unassigned telemetry points (journey_id is NULL) into persistent journeys.
@@ -596,6 +707,16 @@ class JourneyService:
                 app_logger.error(f"[JOURNEY] Error querying unassigned telemetry: {e}")
                 return 0
 
+            if not rows:
+                return 0
+
+            # Synced points never pass through the live receiver, so run the geofence
+            # evaluator here (current fixes only; the evaluator enforces the age limit).
+            self._evaluate_geofences_for_synced_rows(rows)
+
+            # Points inside an approved-route journey belong to that journey and its
+            # route monitor; they must not be regrouped into an automatic journey.
+            rows = self._assign_rows_to_route_journeys(rows)
             if not rows:
                 return 0
 

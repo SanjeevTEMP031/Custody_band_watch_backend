@@ -9,11 +9,16 @@ Verifies:
 6. API routes (/api/v1/journeys/start, /end, /active, /device) operate cleanly
 """
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND_DIR))
+
 from app.services.journey_service import journey_service, format_duration
 from app.services.gps_service import gps_service
 from app.services.firestore_service import firestore_service
@@ -44,7 +49,9 @@ class TestJourneyTracking(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self):
-        self.device_id = "863758061830955"
+        self.device_id = "999999000000001"
+        self._orig_timeout = journey_service.inactivity_timeout_seconds
+        journey_service.inactivity_timeout_seconds = 100000000.0
 
         # Mock Firestore client
         self.mock_db = MagicMock()
@@ -86,6 +93,7 @@ class TestJourneyTracking(unittest.TestCase):
     def tearDown(self):
         journey_service.end_journey(self.device_id)
         journey_service._active_journeys.clear()
+        journey_service.inactivity_timeout_seconds = getattr(self, "_orig_timeout", 600.0)
         self.fs_patch1.stop()
         self.fs_patch2.stop()
 
@@ -334,6 +342,7 @@ class TestJourneyTracking(unittest.TestCase):
 
     def test_9_inactivity_timeout_auto_completes_journey(self):
         """Verifies inactivity > 30 mins auto-completes old journey and starts new one on next fix."""
+        journey_service.inactivity_timeout_seconds = 1800.0
         journey_service.end_journey(self.device_id)
         journey_service._active_journeys.clear()
 

@@ -23,7 +23,7 @@ from .alert_config import (
     LEGACY_ALERT_TYPE_MAP,
 )
 from ..core.firebase import get_firestore_client, is_firebase_active
-from ..utils.datetime_utils import current_iso_timestamp
+from ..utils.datetime_utils import current_iso_timestamp, parse_to_utc_datetime
 from ..utils.logger import app_logger
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -131,6 +131,8 @@ class AlertService:
                     location_is_stale INTEGER NOT NULL DEFAULT 1,
                     raw_event_code TEXT,
                     notes TEXT,
+                    requires_alarm INTEGER NOT NULL DEFAULT 0,
+                    geofence_alert_id TEXT,
                     timestamp TEXT
                 )
             """)
@@ -166,7 +168,9 @@ class AlertService:
                 "location_accuracy_m": "REAL",
                 "location_is_stale": "INTEGER DEFAULT 1",
                 "raw_event_code": "TEXT",
-                "notes": "TEXT"
+                "notes": "TEXT",
+                "requires_alarm": "INTEGER DEFAULT 0",
+                "geofence_alert_id": "TEXT"
             }
             for col, col_def in new_columns.items():
                 if col not in existing_cols:
@@ -178,6 +182,7 @@ class AlertService:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_device_status ON alerts(device_id, status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_alert_id ON alerts(alert_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_geo_id ON alerts(geofence_alert_id)")
 
             # Upgrade devices table for custody sensor states
             existing_dev_cols = [c[1] for c in cur.execute("PRAGMA table_info(devices)").fetchall()]
@@ -222,12 +227,7 @@ class AlertService:
         3. Otherwise 'UNAVAILABLE' (never replace with 0,0 or blindly use device's current location).
         """
         now = datetime.now(timezone.utc)
-        event_dt = now
-        if event_time_iso:
-            try:
-                event_dt = datetime.fromisoformat(event_time_iso.replace("Z", "+00:00"))
-            except Exception:
-                pass
+        event_dt = parse_to_utc_datetime(event_time_iso) or now
 
         # Check Priority 1: Fresh, valid GPS position in event packet
         if (
@@ -239,23 +239,25 @@ class AlertService:
             and abs(event_lon) <= 180.0
         ):
             age_sec = 0
-            if event_gps_time:
-                try:
-                    gps_dt = datetime.fromisoformat(event_gps_time.replace("Z", "+00:00"))
-                    age_sec = max(0, int((event_dt - gps_dt).total_seconds()))
-                except Exception:
-                    pass
+            gps_dt = parse_to_utc_datetime(event_gps_time) if event_gps_time else event_dt
+            if gps_dt:
+                age_sec = int((event_dt - gps_dt).total_seconds())
 
-            is_stale = age_sec > ALERT_CONFIG["gps_unavailable_seconds"]
-            return {
-                "latitude": round(event_lat, 6),
-                "longitude": round(event_lon, 6),
-                "location_source": "GPS_FRESH" if not is_stale else "HISTORICAL",
-                "location_timestamp": event_gps_time or event_time_iso or now.isoformat(),
-                "location_age_seconds": age_sec,
-                "location_accuracy_m": 5.0,
-                "location_is_stale": is_stale
-            }
+            if age_sec < -15:
+                # Future GPS reading (>15s into future) is untrusted / rejected
+                pass
+            else:
+                display_age_sec = max(0, age_sec)
+                is_stale = display_age_sec > ALERT_CONFIG["gps_unavailable_seconds"]
+                return {
+                    "latitude": round(event_lat, 6),
+                    "longitude": round(event_lon, 6),
+                    "location_source": "GPS_FRESH" if not is_stale else "HISTORICAL",
+                    "location_timestamp": event_gps_time or event_time_iso or now.isoformat(),
+                    "location_age_seconds": display_age_sec,
+                    "location_accuracy_m": 5.0,
+                    "location_is_stale": is_stale
+                }
 
         # Check Priority 2: Last known valid GPS position from telemetry database
         with self._db_lock:
@@ -275,20 +277,22 @@ class AlertService:
             hist_time = row["timestamp"]
             age_sec = None
             if hist_time:
-                try:
-                    hist_dt = datetime.fromisoformat(str(hist_time).replace("Z", "+00:00"))
-                    age_sec = max(0, int((event_dt - hist_dt).total_seconds()))
-                except Exception:
-                    pass
+                hist_dt = parse_to_utc_datetime(hist_time)
+                if hist_dt:
+                    age_diff = (event_dt - hist_dt).total_seconds()
+                    if age_diff >= -15:
+                        age_sec = max(0, int(age_diff))
 
+            display_age = age_sec if age_sec is not None else 120
+            is_stale = display_age > ALERT_CONFIG["gps_unavailable_seconds"]
             return {
                 "latitude": round(hist_lat, 6),
                 "longitude": round(hist_lon, 6),
-                "location_source": "HISTORICAL",
+                "location_source": "HISTORICAL" if is_stale else "GPS_FRESH",
                 "location_timestamp": hist_time,
-                "location_age_seconds": age_sec if age_sec is not None else 120,
+                "location_age_seconds": display_age,
                 "location_accuracy_m": 15.0,
-                "location_is_stale": True
+                "location_is_stale": is_stale
             }
 
         # Priority 3: Location Unavailable
@@ -319,7 +323,9 @@ class AlertService:
         event_time: Optional[str] = None,
         source: str = "C05_DEVICE",
         raw_event_code: Optional[str] = None,
-        sensor_states: Optional[Dict[str, Any]] = None
+        sensor_states: Optional[Dict[str, Any]] = None,
+        requires_alarm: Optional[bool] = None,
+        geofence_alert_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Authoritatively creates or deduplicates an active alert.
@@ -331,6 +337,15 @@ class AlertService:
         msg = message or f"Security event {canonical_type} reported for device {device_id}."
         now_iso = current_iso_timestamp()
         event_time_iso = event_time or now_iso
+
+        if requires_alarm is not None:
+            alarm_flag = bool(requires_alarm)
+        else:
+            alarm_flag = (sev in ("CRITICAL", "HIGH") or canonical_type in (
+                "GEOFENCE_BREACH", "EXCLUSION_ZONE_BREACH", "ROUTE_DEVIATION_ALERT",
+                "UNAUTHORIZED_EARLY_DEPARTURE", "JOURNEY_OVERDUE", "SOS_ALERT",
+                "STRAP_CUT_ALERT", "TAMPER_ALERT", "BRACELET_REMOVED"
+            ))
 
         # 1. Deduplication check: Is there already an ongoing active/acknowledged alert of this type?
         with self._db_lock:
@@ -386,6 +401,8 @@ class AlertService:
             "location_is_stale": 1 if loc_snap["location_is_stale"] else 0,
             "raw_event_code": raw_event_code,
             "notes": None,
+            "requires_alarm": 1 if alarm_flag else 0,
+            "geofence_alert_id": geofence_alert_id,
             "timestamp": event_time_iso
         }
 
@@ -398,8 +415,9 @@ class AlertService:
                     alert_id, device_id, alert_type, severity, status, title, message, source,
                     event_time, received_at, acknowledged_at, acknowledged_by, resolved_at, resolved_by,
                     latitude, longitude, location_source, location_timestamp, location_age_seconds,
-                    location_accuracy_m, location_is_stale, raw_event_code, notes, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    location_accuracy_m, location_is_stale, raw_event_code, notes, requires_alarm,
+                    geofence_alert_id, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 alert_record["alert_id"],
                 alert_record["device_id"],
@@ -424,6 +442,8 @@ class AlertService:
                 alert_record["location_is_stale"],
                 alert_record["raw_event_code"],
                 alert_record["notes"],
+                alert_record["requires_alarm"],
+                alert_record["geofence_alert_id"],
                 alert_record["timestamp"]
             ))
             inserted_id = cur.lastrowid
@@ -439,9 +459,9 @@ class AlertService:
                 try:
                     db = get_firestore_client()
                     if db:
-                        # Store in alerts/{alert_id}
                         fs_payload = {**alert_record}
                         fs_payload["location_is_stale"] = bool(alert_record["location_is_stale"])
+                        fs_payload["requires_alarm"] = bool(alarm_flag)
                         db.collection("alerts").document(alert_unique_id).set(fs_payload, merge=True)
                 except Exception as e:
                     app_logger.error(f"[FIRESTORE ALERT SYNC] Failed to push alert {alert_unique_id}: {e}")
@@ -481,41 +501,101 @@ class AlertService:
         notes: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Acknowledges an alert without resolving ongoing hardware alarm conditions.
+        Acknowledges an alert and silences audible alarm (requires_alarm=0).
+        Synchronizes both alerts and geofence_alerts tables and Firestore collections.
         """
         now_iso = current_iso_timestamp()
+        target_str = str(alert_identifier).strip()
+        geo_id = None
+        alert_id_str = None
+        dev_id = None
+        int_id = None
+
         with self._db_lock:
             conn = self._get_connection()
             cur = conn.cursor()
 
-            # Query by integer id or string alert_id
-            if isinstance(alert_identifier, int) or (isinstance(alert_identifier, str) and alert_identifier.isdigit()):
-                row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int(alert_identifier),)).fetchone()
+            # 1. Search in alerts table by id, alert_id, or geofence_alert_id
+            row = None
+            if isinstance(alert_identifier, int) or target_str.isdigit():
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE id = ? OR alert_id = ? OR geofence_alert_id = ?",
+                    (int(target_str), target_str, target_str)
+                ).fetchone()
             else:
-                row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (str(alert_identifier),)).fetchone()
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE alert_id = ? OR geofence_alert_id = ?",
+                    (target_str, target_str)
+                ).fetchone()
 
+            # 2. If not found in alerts, check in geofence_alerts
+            geo_row = None
             if not row:
+                try:
+                    geo_row = cur.execute(
+                        "SELECT * FROM geofence_alerts WHERE id = ? OR core_alert_id = ? OR event_id = ?",
+                        (target_str, target_str, target_str)
+                    ).fetchone()
+                    if geo_row:
+                        geo_id = geo_row["id"]
+                        dev_id = geo_row["device_id"]
+                        core_id = geo_row["core_alert_id"]
+                        if core_id:
+                            row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (core_id,)).fetchone()
+                except Exception:
+                    pass
+            else:
+                geo_id = row["geofence_alert_id"]
+                if not geo_id:
+                    try:
+                        gr = cur.execute(
+                            "SELECT id FROM geofence_alerts WHERE core_alert_id = ? OR id = ?",
+                            (row["alert_id"], target_str)
+                        ).fetchone()
+                        if gr:
+                            geo_id = gr["id"]
+                    except Exception:
+                        pass
+
+            if not row and not geo_row:
                 conn.close()
                 return None
 
-            alert_id_str = row["alert_id"] or f"alt_{row['id']}"
-            int_id = row["id"]
-            dev_id = row["device_id"]
+            if row:
+                alert_id_str = row["alert_id"] or f"alt_{row['id']}"
+                int_id = row["id"]
+                dev_id = row["device_id"]
+                cur.execute("""
+                    UPDATE alerts
+                    SET status = 'ACKNOWLEDGED',
+                        requires_alarm = 0,
+                        acknowledged_at = ?,
+                        acknowledged_by = ?,
+                        notes = COALESCE(?, notes)
+                    WHERE id = ?
+                """, (now_iso, acknowledged_by, notes, int_id))
 
-            cur.execute("""
-                UPDATE alerts
-                SET status = 'ACKNOWLEDGED',
-                    acknowledged_at = ?,
-                    acknowledged_by = ?,
-                    notes = COALESCE(?, notes)
-                WHERE id = ?
-            """, (now_iso, acknowledged_by, notes, int_id))
+            # Synchronize geofence_alerts table
+            try:
+                cur.execute("""
+                    UPDATE geofence_alerts
+                    SET status = 'ACKNOWLEDGED',
+                        requires_alarm = 0,
+                        acknowledged_at = ?,
+                        acknowledged_by = ?,
+                        updated_at = ?
+                    WHERE id = ? OR core_alert_id = ? OR event_id = ? OR (? IS NOT NULL AND id = ?)
+                """, (now_iso, acknowledged_by, now_iso, target_str, alert_id_str or target_str, target_str, geo_id, geo_id or ""))
+            except Exception:
+                pass
+
             conn.commit()
-
-            updated_row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int_id,)).fetchone()
+            updated_row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int_id,)).fetchone() if int_id else None
             conn.close()
 
-        updated_dict = self._format_alert_row(updated_row)
+        updated_dict = self._format_alert_row(updated_row) if updated_row else (dict(geo_row) if geo_row else {})
+        if not alert_id_str:
+            alert_id_str = target_str
 
         # Sync update to Firestore
         if is_firebase_active():
@@ -525,22 +605,237 @@ class AlertService:
                     if db:
                         db.collection("alerts").document(alert_id_str).set({
                             "status": "ACKNOWLEDGED",
+                            "requires_alarm": False,
+                            "acknowledged": True,
                             "acknowledged_at": now_iso,
                             "acknowledged_by": acknowledged_by,
                             "notes": notes
                         }, merge=True)
+                        if geo_id and geo_id != alert_id_str:
+                            db.collection("geofence_alerts").document(geo_id).set({
+                                "status": "ACKNOWLEDGED",
+                                "requires_alarm": False,
+                                "acknowledged": True,
+                                "acknowledged_at": now_iso,
+                                "acknowledged_by": acknowledged_by,
+                                "updated_at": now_iso
+                            }, merge=True)
+                            db.collection("alerts").document(geo_id).set({
+                                "status": "ACKNOWLEDGED",
+                                "requires_alarm": False,
+                                "acknowledged": True,
+                                "acknowledged_at": now_iso,
+                                "acknowledged_by": acknowledged_by
+                            }, merge=True)
                 except Exception as e:
                     app_logger.error(f"[FIRESTORE ACK SYNC] Error: {e}")
 
             threading.Thread(target=_sync_ack, daemon=True).start()
 
-        self._log_audit(alert_id_str, dev_id, "ACKNOWLEDGED", acknowledged_by, notes or "")
+        if dev_id:
+            self._log_audit(alert_id_str, dev_id, "ACKNOWLEDGED", acknowledged_by, notes or "")
+            self._update_device_alert_state(dev_id)
+
+        normalized = self._normalize_api_alert(updated_dict)
+        normalized["requires_alarm"] = False
+        normalized["acknowledged"] = True
+
         ws_manager.broadcast({
             "type": "ALERT_UPDATE",
-            "alert": self._normalize_api_alert(updated_dict)
+            "alert": normalized
         })
+        if geo_id or "GEOFENCE" in str(normalized.get("type", "")).upper():
+            ws_manager.broadcast({
+                "type": "GEOFENCE_ALERT_ACKNOWLEDGED",
+                "alert_id": geo_id or alert_id_str,
+                "core_alert_id": alert_id_str,
+                "device_id": dev_id,
+                "status": "ACKNOWLEDGED",
+                "requires_alarm": False,
+                "acknowledged_by": acknowledged_by,
+                "acknowledged_at": now_iso,
+                "notes": notes
+            })
 
-        return self._normalize_api_alert(updated_dict)
+        return normalized
+
+    # -------------------------------------------------------------------------
+    # Alert Silence
+    # -------------------------------------------------------------------------
+    def silence_alert(
+        self,
+        alert_identifier: Any,
+        silenced_by: str = "admin",
+        notes: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Silences audible alarms without removing the alert from incident history.
+        Sets requires_alarm=0, status='ACKNOWLEDGED', and broadcasts ALERT_SILENCED.
+        Synchronizes both alerts and geofence_alerts tables and Firestore collections.
+        """
+        now_iso = current_iso_timestamp()
+        target_str = str(alert_identifier).strip()
+        geo_id = None
+        alert_id_str = None
+        dev_id = None
+        int_id = None
+        silence_note = notes or "Silenced by monitoring officer"
+
+        with self._db_lock:
+            conn = self._get_connection()
+            cur = conn.cursor()
+
+            # 1. Search in alerts table by id, alert_id, or geofence_alert_id
+            row = None
+            if isinstance(alert_identifier, int) or target_str.isdigit():
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE id = ? OR alert_id = ? OR geofence_alert_id = ?",
+                    (int(target_str), target_str, target_str)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE alert_id = ? OR geofence_alert_id = ?",
+                    (target_str, target_str)
+                ).fetchone()
+
+            # 2. If not found in alerts, check in geofence_alerts
+            geo_row = None
+            if not row:
+                try:
+                    geo_row = cur.execute(
+                        "SELECT * FROM geofence_alerts WHERE id = ? OR core_alert_id = ? OR event_id = ?",
+                        (target_str, target_str, target_str)
+                    ).fetchone()
+                    if geo_row:
+                        geo_id = geo_row["id"]
+                        dev_id = geo_row["device_id"]
+                        core_id = geo_row["core_alert_id"]
+                        if core_id:
+                            row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (core_id,)).fetchone()
+                except Exception:
+                    pass
+            else:
+                geo_id = row["geofence_alert_id"]
+                if not geo_id:
+                    try:
+                        gr = cur.execute(
+                            "SELECT id FROM geofence_alerts WHERE core_alert_id = ? OR id = ?",
+                            (row["alert_id"], target_str)
+                        ).fetchone()
+                        if gr:
+                            geo_id = gr["id"]
+                    except Exception:
+                        pass
+
+            if not row and not geo_row:
+                conn.close()
+                return None
+
+            if row:
+                alert_id_str = row["alert_id"] or f"alt_{row['id']}"
+                int_id = row["id"]
+                dev_id = row["device_id"]
+                cur.execute("""
+                    UPDATE alerts
+                    SET status = 'ACKNOWLEDGED',
+                        requires_alarm = 0,
+                        acknowledged_at = COALESCE(acknowledged_at, ?),
+                        acknowledged_by = COALESCE(acknowledged_by, ?),
+                        notes = COALESCE(?, notes)
+                    WHERE id = ?
+                """, (now_iso, silenced_by, silence_note, int_id))
+
+            try:
+                cur.execute("""
+                    UPDATE geofence_alerts
+                    SET status = 'ACKNOWLEDGED',
+                        requires_alarm = 0,
+                        acknowledged_at = COALESCE(acknowledged_at, ?),
+                        acknowledged_by = COALESCE(acknowledged_by, ?),
+                        updated_at = ?
+                    WHERE id = ? OR core_alert_id = ? OR event_id = ? OR (? IS NOT NULL AND id = ?)
+                """, (now_iso, silenced_by, now_iso, target_str, alert_id_str or target_str, target_str, geo_id, geo_id or ""))
+            except Exception:
+                pass
+
+            conn.commit()
+            updated_row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int_id,)).fetchone() if int_id else None
+            conn.close()
+
+        updated_dict = self._format_alert_row(updated_row) if updated_row else (dict(geo_row) if geo_row else {})
+        if not alert_id_str:
+            alert_id_str = target_str
+
+        if is_firebase_active():
+            def _sync_silence():
+                try:
+                    db = get_firestore_client()
+                    if db:
+                        db.collection("alerts").document(alert_id_str).set({
+                            "status": "ACKNOWLEDGED",
+                            "requires_alarm": False,
+                            "acknowledged": True,
+                            "acknowledged_at": now_iso,
+                            "acknowledged_by": silenced_by,
+                            "notes": silence_note
+                        }, merge=True)
+                        if geo_id and geo_id != alert_id_str:
+                            db.collection("geofence_alerts").document(geo_id).set({
+                                "status": "ACKNOWLEDGED",
+                                "requires_alarm": False,
+                                "acknowledged": True,
+                                "acknowledged_at": now_iso,
+                                "acknowledged_by": silenced_by,
+                                "updated_at": now_iso
+                            }, merge=True)
+                            db.collection("alerts").document(geo_id).set({
+                                "status": "ACKNOWLEDGED",
+                                "requires_alarm": False,
+                                "acknowledged": True,
+                                "acknowledged_at": now_iso,
+                                "acknowledged_by": silenced_by
+                            }, merge=True)
+                except Exception as e:
+                    app_logger.error(f"[FIRESTORE SILENCE SYNC] Error: {e}")
+
+            threading.Thread(target=_sync_silence, daemon=True).start()
+
+        if dev_id:
+            self._log_audit(alert_id_str, dev_id, "SILENCED", silenced_by, silence_note)
+            self._update_device_alert_state(dev_id)
+
+        normalized = self._normalize_api_alert(updated_dict)
+        normalized["requires_alarm"] = False
+        normalized["acknowledged"] = True
+
+        ws_manager.broadcast({
+            "type": "ALERT_SILENCED",
+            "alert_id": alert_id_str,
+            "device_id": dev_id,
+            "requires_alarm": False,
+            "status": "ACKNOWLEDGED",
+            "silenced_by": silenced_by,
+            "silenced_at": now_iso,
+            "alert": normalized
+        })
+        ws_manager.broadcast({
+            "type": "ALERT_UPDATE",
+            "alert": normalized
+        })
+        if geo_id or "GEOFENCE" in str(normalized.get("type", "")).upper():
+            ws_manager.broadcast({
+                "type": "GEOFENCE_ALERT_ACKNOWLEDGED",
+                "alert_id": geo_id or alert_id_str,
+                "core_alert_id": alert_id_str,
+                "device_id": dev_id,
+                "status": "ACKNOWLEDGED",
+                "requires_alarm": False,
+                "acknowledged_by": silenced_by,
+                "acknowledged_at": now_iso,
+                "notes": silence_note
+            })
+
+        return normalized
 
     # -------------------------------------------------------------------------
     # Alert Resolution
@@ -553,39 +848,97 @@ class AlertService:
     ) -> Optional[Dict[str, Any]]:
         """
         Marks an alert as RESOLVED and recalculates device active alert state.
+        Synchronizes both alerts and geofence_alerts tables and Firestore collections.
         """
         now_iso = current_iso_timestamp()
+        target_str = str(alert_identifier).strip()
+        geo_id = None
+        alert_id_str = None
+        dev_id = None
+        int_id = None
+
         with self._db_lock:
             conn = self._get_connection()
             cur = conn.cursor()
 
-            if isinstance(alert_identifier, int) or (isinstance(alert_identifier, str) and alert_identifier.isdigit()):
-                row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int(alert_identifier),)).fetchone()
+            row = None
+            if isinstance(alert_identifier, int) or target_str.isdigit():
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE id = ? OR alert_id = ? OR geofence_alert_id = ?",
+                    (int(target_str), target_str, target_str)
+                ).fetchone()
             else:
-                row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (str(alert_identifier),)).fetchone()
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE alert_id = ? OR geofence_alert_id = ?",
+                    (target_str, target_str)
+                ).fetchone()
 
+            geo_row = None
             if not row:
+                try:
+                    geo_row = cur.execute(
+                        "SELECT * FROM geofence_alerts WHERE id = ? OR core_alert_id = ? OR event_id = ?",
+                        (target_str, target_str, target_str)
+                    ).fetchone()
+                    if geo_row:
+                        geo_id = geo_row["id"]
+                        dev_id = geo_row["device_id"]
+                        core_id = geo_row["core_alert_id"]
+                        if core_id:
+                            row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (core_id,)).fetchone()
+                except Exception:
+                    pass
+            else:
+                geo_id = row["geofence_alert_id"]
+                if not geo_id:
+                    try:
+                        gr = cur.execute(
+                            "SELECT id FROM geofence_alerts WHERE core_alert_id = ? OR id = ?",
+                            (row["alert_id"], target_str)
+                        ).fetchone()
+                        if gr:
+                            geo_id = gr["id"]
+                    except Exception:
+                        pass
+
+            if not row and not geo_row:
                 conn.close()
                 return None
 
-            alert_id_str = row["alert_id"] or f"alt_{row['id']}"
-            int_id = row["id"]
-            dev_id = row["device_id"]
+            if row:
+                alert_id_str = row["alert_id"] or f"alt_{row['id']}"
+                int_id = row["id"]
+                dev_id = row["device_id"]
+                cur.execute("""
+                    UPDATE alerts
+                    SET status = 'RESOLVED',
+                        requires_alarm = 0,
+                        resolved_at = ?,
+                        resolved_by = ?,
+                        notes = COALESCE(?, notes)
+                    WHERE id = ?
+                """, (now_iso, resolved_by, resolution_notes or "Resolved", int_id))
 
-            cur.execute("""
-                UPDATE alerts
-                SET status = 'RESOLVED',
-                    resolved_at = ?,
-                    resolved_by = ?,
-                    notes = COALESCE(?, notes)
-                WHERE id = ?
-            """, (now_iso, resolved_by, resolution_notes or "Resolved", int_id))
+            try:
+                cur.execute("""
+                    UPDATE geofence_alerts
+                    SET status = 'RESOLVED',
+                        requires_alarm = 0,
+                        resolved_at = ?,
+                        resolved_by = ?,
+                        updated_at = ?
+                    WHERE id = ? OR core_alert_id = ? OR event_id = ? OR (? IS NOT NULL AND id = ?)
+                """, (now_iso, resolved_by, now_iso, target_str, alert_id_str or target_str, target_str, geo_id, geo_id or ""))
+            except Exception:
+                pass
+
             conn.commit()
-
-            updated_row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int_id,)).fetchone()
+            updated_row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int_id,)).fetchone() if int_id else None
             conn.close()
 
-        updated_dict = self._format_alert_row(updated_row)
+        updated_dict = self._format_alert_row(updated_row) if updated_row else (dict(geo_row) if geo_row else {})
+        if not alert_id_str:
+            alert_id_str = target_str
 
         # Update Firestore alert record
         if is_firebase_active():
@@ -595,24 +948,62 @@ class AlertService:
                     if db:
                         db.collection("alerts").document(alert_id_str).set({
                             "status": "RESOLVED",
+                            "requires_alarm": False,
                             "resolved_at": now_iso,
                             "resolved_by": resolved_by,
                             "notes": resolution_notes
                         }, merge=True)
+                        if geo_id and geo_id != alert_id_str:
+                            db.collection("geofence_alerts").document(geo_id).set({
+                                "status": "RESOLVED",
+                                "requires_alarm": False,
+                                "resolved_at": now_iso,
+                                "resolved_by": resolved_by,
+                                "updated_at": now_iso
+                            }, merge=True)
+                            db.collection("alerts").document(geo_id).set({
+                                "status": "RESOLVED",
+                                "requires_alarm": False,
+                                "resolved_at": now_iso,
+                                "resolved_by": resolved_by
+                            }, merge=True)
                 except Exception as e:
                     app_logger.error(f"[FIRESTORE RESOLVE SYNC] Error: {e}")
 
             threading.Thread(target=_sync_res, daemon=True).start()
 
-        self._update_device_alert_state(dev_id)
-        self._log_audit(alert_id_str, dev_id, "RESOLVED", resolved_by, resolution_notes or "")
+        if dev_id:
+            self._update_device_alert_state(dev_id)
+            self._log_audit(alert_id_str, dev_id, "RESOLVED", resolved_by, resolution_notes or "")
+
+        normalized = self._normalize_api_alert(updated_dict)
+        normalized["requires_alarm"] = False
 
         ws_manager.broadcast({
             "type": "ALERT_UPDATE",
-            "alert": self._normalize_api_alert(updated_dict)
+            "alert": normalized
         })
+        ws_manager.broadcast({
+            "type": "ALERT_RESOLVED",
+            "alert_id": alert_id_str,
+            "device_id": dev_id,
+            "status": "RESOLVED",
+            "requires_alarm": False
+        })
+        if geo_id or "GEOFENCE" in str(normalized.get("type", "")).upper():
+            ws_manager.broadcast({
+                "type": "GEOFENCE_ALERT_RESOLVED",
+                "alert_id": geo_id or alert_id_str,
+                "core_alert_id": alert_id_str,
+                "device_id": dev_id,
+                "geofence_id": normalized.get("geofence_id"),
+                "status": "RESOLVED",
+                "requires_alarm": False,
+                "resolved_by": resolved_by,
+                "resolved_at": now_iso
+            })
 
-        return self._normalize_api_alert(updated_dict)
+        return normalized
 
     # -------------------------------------------------------------------------
     # Condition Cleared -> Auto Resolution
@@ -829,20 +1220,64 @@ class AlertService:
             rows = cur.execute(query, params).fetchall()
             conn.close()
 
-        return [self._normalize_api_alert(self._format_alert_row(r)) for r in rows]
+        results = []
+        seen_keys = set()
+        for r in rows:
+            formatted = self._normalize_api_alert(self._format_alert_row(r))
+            aid = str(formatted.get("alert_id") or formatted.get("id") or "")
+            dev = str(formatted.get("device_id") or "")
+            atype = str(formatted.get("alert_type") or "")
+            ts = str(formatted.get("timestamp") or formatted.get("event_time") or "")
+            sig = aid or f"{dev}_{atype}_{ts}"
+            if sig in seen_keys:
+                continue
+            seen_keys.add(sig)
+            results.append(formatted)
+        return results
 
     def get_recent_alerts(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Backwards-compatible helper returning most recent alerts."""
         return self.list_alerts(limit=limit)
 
+    def get_device_alerts(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Returns alerts for a specific device."""
+        return self.list_alerts(device_id=device_id, limit=limit)
+
     def get_alert_by_id(self, alert_identifier: Any) -> Optional[Dict[str, Any]]:
+        target_str = str(alert_identifier).strip()
         with self._db_lock:
             conn = self._get_connection()
             cur = conn.cursor()
-            if isinstance(alert_identifier, int) or (isinstance(alert_identifier, str) and alert_identifier.isdigit()):
-                row = cur.execute("SELECT * FROM alerts WHERE id = ?", (int(alert_identifier),)).fetchone()
+            row = None
+            if isinstance(alert_identifier, int) or target_str.isdigit():
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE id = ? OR alert_id = ? OR geofence_alert_id = ?",
+                    (int(target_str), target_str, target_str)
+                ).fetchone()
             else:
-                row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (str(alert_identifier),)).fetchone()
+                row = cur.execute(
+                    "SELECT * FROM alerts WHERE alert_id = ? OR geofence_alert_id = ?",
+                    (target_str, target_str)
+                ).fetchone()
+
+            # Fallback to geofence_alerts if not found in alerts
+            if not row:
+                try:
+                    geo_row = cur.execute(
+                        "SELECT * FROM geofence_alerts WHERE id = ? OR core_alert_id = ? OR event_id = ?",
+                        (target_str, target_str, target_str)
+                    ).fetchone()
+                    if geo_row:
+                        core_id = geo_row["core_alert_id"]
+                        if core_id:
+                            row = cur.execute("SELECT * FROM alerts WHERE alert_id = ?", (core_id,)).fetchone()
+                        if not row:
+                            conn.close()
+                            d = dict(geo_row)
+                            d["requires_alarm"] = bool(d.get("requires_alarm")) if d.get("status") not in ("ACKNOWLEDGED", "SILENCED", "RESOLVED", "CLOSED") else False
+                            return self._normalize_api_alert(d)
+                except Exception:
+                    pass
             conn.close()
 
         if not row:
@@ -873,6 +1308,7 @@ class AlertService:
 
         # Most recent valid location snapshot
         loc_snap = self.capture_location_snapshot(device_id=device_id)
+        has_alarm = any(bool(a.get("requires_alarm")) for a in active_alerts)
 
         return {
             "device_id": device_id,
@@ -887,6 +1323,7 @@ class AlertService:
             },
             "active_alert_count": len(active_alerts),
             "has_critical_alert": any(a.get("severity") == "CRITICAL" for a in active_alerts),
+            "requires_alarm": has_alarm,
             "active_alerts": active_alerts,
             "recent_alerts": recent_alerts,
             "last_known_location": loc_snap,
@@ -1054,6 +1491,7 @@ class AlertService:
     def _format_alert_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
         d["location_is_stale"] = bool(d.get("location_is_stale", 1))
+        d["requires_alarm"] = bool(d.get("requires_alarm", 0))
         return d
 
     def _normalize_api_alert(self, alert_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1064,10 +1502,33 @@ class AlertService:
         d.setdefault("type", d.get("alert_type"))
         d.setdefault("created_at", d.get("event_time") or d.get("timestamp"))
         d.setdefault("date", d.get("event_time") or d.get("timestamp"))
-        d["severity"] = str(d.get("severity", "HIGH")).upper()
-        d.setdefault("status", d.get("status", "ACTIVE"))
+        sev = str(d.get("severity", "HIGH")).upper()
+        d["severity"] = sev
+        st = str(d.get("status", "ACTIVE")).upper()
+        d["status"] = st
         d.setdefault("location_time", d.get("location_timestamp"))
         d["location_is_stale"] = bool(d.get("location_is_stale"))
+        # The alerts table has no gps_valid column. Route-monitor alerts are only raised
+        # from verified fixes and always store that fix's own coordinates, so the flag is
+        # provable for them; other sources may carry a last-known telemetry position.
+        if "gps_valid" not in d:
+            d["gps_valid"] = bool(
+                str(d.get("source") or "").upper() == "ROUTE_MONITOR"
+                and str(d.get("location_source") or "").upper() in ("GPS_FRESH", "HISTORICAL")
+                and d.get("latitude") is not None
+                and d.get("longitude") is not None
+            )
+
+        if st in ("ACKNOWLEDGED", "SILENCED", "RESOLVED", "CLOSED"):
+            d["requires_alarm"] = False
+            d["acknowledged"] = True
+        else:
+            if "requires_alarm" in d and d["requires_alarm"] is not None:
+                d["requires_alarm"] = bool(d["requires_alarm"])
+            else:
+                d["requires_alarm"] = (sev in ("CRITICAL", "HIGH"))
+            d["acknowledged"] = False
+
         return d
 
     def _log_audit(self, alert_id: str, device_id: str, action: str, performed_by: str, details: str):

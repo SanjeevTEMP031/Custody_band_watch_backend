@@ -183,7 +183,10 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
     def tearDown(self):
         self.firebase_patcher.stop()
         self.db_patcher.stop()
-        self.temp_dir.cleanup()
+        try:
+            self.temp_dir.cleanup()
+        except (PermissionError, OSError):
+            pass
 
     def test_timestamp_ordered_latest_fix_and_complete_history(self):
         older_time = iso_at(timedelta(minutes=-2))
@@ -651,7 +654,10 @@ class FirestoreDeviceReadCacheTests(unittest.TestCase):
     def tearDown(self):
         self.firebase_patcher.stop()
         self.db_patcher.stop()
-        self.temp_dir.cleanup()
+        try:
+            self.temp_dir.cleanup()
+        except (PermissionError, OSError):
+            pass
 
     def test_repeated_device_reads_use_cached_firestore_document(self):
         snapshot = MagicMock()
@@ -1308,7 +1314,10 @@ class WatchGpsPersistenceTests(unittest.TestCase):
     def tearDown(self):
         self.firebase_patcher.stop()
         self.db_patcher.stop()
-        self.temp_dir.cleanup()
+        try:
+            self.temp_dir.cleanup()
+        except (PermissionError, OSError):
+            pass
 
     @staticmethod
     def _packet(timestamp: datetime, status: str, latitude: float, longitude: float, satellites: int = 0):

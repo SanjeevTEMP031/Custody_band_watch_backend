@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from google.cloud import firestore as cloud_firestore
 from ..core.firebase import get_firestore_client, is_firebase_active
 from ..utils.logger import app_logger
-from ..utils.datetime_utils import current_iso_timestamp
+from ..utils.datetime_utils import current_iso_timestamp, parse_to_utc_datetime
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 LOCAL_DB = BASE_DIR / "custody_watch.db"
@@ -76,19 +76,7 @@ def _json_default(value: Any):
 
 
 def parse_iso_timestamp(value: Any) -> Optional[datetime]:
-    if isinstance(value, datetime):
-        parsed = value
-    elif value is not None:
-        try:
-            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return None
-    else:
-        return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_to_utc_datetime(value)
 
 
 def normalize_iso_timestamp(value: Any) -> Optional[str]:
@@ -149,7 +137,7 @@ def normalize_verified_gps_fix(
         return None
 
     age_seconds = (datetime.now(timezone.utc) - fix_time).total_seconds()
-    if age_seconds < 0 or (
+    if age_seconds < -15.0 or (
         max_age_seconds is not None and age_seconds > max_age_seconds
     ):
         return None
@@ -162,6 +150,9 @@ class FirestoreService:
     DEVICES_CACHE_TTL_SECONDS = 30
     JOURNEY_CACHE_TTL_SECONDS = 30
     HISTORY_SYNC_INTERVAL_SECONDS = 120
+    # While a device has an open approved-route journey its GPS must reach the route
+    # monitor and geofence evaluator promptly, even if no page is polling history.
+    ROUTE_JOURNEY_SYNC_INTERVAL_SECONDS = 15
     FIRESTORE_READ_RETRY_BASE_SECONDS = 5
     FIRESTORE_READ_RETRY_MAX_SECONDS = 300
 
@@ -237,7 +228,7 @@ class FirestoreService:
         local_fix = parse_iso_timestamp(local.get("last_valid_gps_time"))
         location_source = (
             local
-            if local_fix is not None and (remote_fix is None or local_fix > remote_fix)
+            if local_fix is not None and (remote_fix is None or local_fix >= remote_fix)
             else remote
         )
         for key in (
@@ -560,6 +551,13 @@ class FirestoreService:
         if "firestore_document_id" not in existing_telem_cols:
             try:
                 cur.execute("ALTER TABLE telemetry ADD COLUMN firestore_document_id TEXT")
+            except Exception:
+                pass
+        # Used by journey_service to tag telemetry with its journey; previously never
+        # created, so fresh databases failed every process_unassigned_telemetry query.
+        if "journey_id" not in existing_telem_cols:
+            try:
+                cur.execute("ALTER TABLE telemetry ADD COLUMN journey_id TEXT")
             except Exception:
                 pass
         cur.execute("""
@@ -956,15 +954,16 @@ class FirestoreService:
         if incoming_lon is None:
             incoming_lon = device_data.get("longitude", device_data.get("lon", device_data.get("lng")))
         verified_fix = normalize_verified_gps_fix(
-            device_data.get("gps_valid"),
+            device_data.get("gps_valid", False),
             incoming_lat,
             incoming_lon,
             device_data.get("last_valid_gps_time"),
-            device_data.get("gps_source")
+            device_data.get("gps_source"),
+            max_age_seconds=None
         )
-        incoming_position = verified_fix[:2] if verified_fix else None
-        incoming_fix_time = verified_fix[2] if verified_fix else None
-        incoming_fix_is_valid = verified_fix is not None
+        incoming_position = verified_fix[:2] if verified_fix else valid_coordinate_pair(incoming_lat, incoming_lon)
+        incoming_fix_time = verified_fix[2] if verified_fix else normalize_iso_timestamp(device_data.get("last_valid_gps_time"))
+        incoming_fix_is_valid = verified_fix is not None or (incoming_position is not None and incoming_fix_time is not None)
         gps_state_supplied = "gps_valid" in device_data or "gps_status" in device_data
         received_at = normalize_iso_timestamp(device_data.get("last_seen")) or current_iso_timestamp()
         gps_valid_value = is_gps_valid_flag(device_data.get("gps_valid", False))
@@ -988,12 +987,16 @@ class FirestoreService:
             maps_url = previous.get("maps_url")
             accepted_fix = (
                 incoming_fix_is_valid
+                and incoming_position is not None
+                and incoming_fix_time is not None
                 and is_newer_timestamp(incoming_fix_time, last_valid_gps_time)
             )
             gps_source_value = (
-                verified_fix[3] if accepted_fix and verified_fix else previous.get("gps_source")
+                (verified_fix[3] if verified_fix else device_data.get("gps_source"))
+                if accepted_fix
+                else (device_data.get("gps_source") or previous.get("gps_source"))
             )
-            if accepted_fix and incoming_position is not None:
+            if accepted_fix and incoming_position is not None and incoming_fix_time is not None:
                 last_lat, last_lon = incoming_position
                 last_valid_gps_time = incoming_fix_time
                 maps_url = f"https://maps.google.com/?q={last_lat:.6f},{last_lon:.6f}"
@@ -1003,12 +1006,8 @@ class FirestoreService:
             )
             if state_is_newer:
                 incoming_gps_valid = is_gps_valid_flag(device_data.get("gps_valid", False))
-                if not incoming_gps_valid or accepted_fix:
-                    gps_valid_value = 1 if incoming_gps_valid and accepted_fix else 0
-                    gps_status_value = device_data.get("gps_status", "No Fix")
-                else:
-                    gps_valid_value = previous.get("gps_valid", 0)
-                    gps_status_value = previous.get("gps_status", "No Fix")
+                gps_valid_value = 1 if incoming_gps_valid else 0
+                gps_status_value = device_data.get("gps_status", "GPS Locked" if incoming_gps_valid else "No Fix")
             else:
                 gps_valid_value = previous.get("gps_valid", 0)
                 gps_status_value = previous.get("gps_status", "No Fix")
@@ -1160,8 +1159,9 @@ class FirestoreService:
                         if batt_val is not None:
                             sync_doc.update(_battery_fields(batt_val))
 
-                        location = incoming_position if incoming_fix_is_valid else None
-                        if location is not None and incoming_fix_time is not None:
+                        location = incoming_position if (incoming_fix_is_valid or accepted_fix) else None
+                        fix_ts = incoming_fix_time or last_valid_gps_time
+                        if location is not None and fix_ts is not None:
                             lat, lon = location
                             sync_doc.update({
                                 "last_latitude": lat,
@@ -1170,14 +1170,14 @@ class FirestoreService:
                                 "lon": lon,
                                 "latitude": lat,
                                 "longitude": lon,
-                                "last_valid_gps_time": incoming_fix_time,
+                                "last_valid_gps_time": fix_ts,
                                 "maps_url": f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
                             })
-                            gps_source = verified_fix[3] if verified_fix else None
+                            gps_source = (verified_fix[3] if verified_fix else None) or gps_source_value
                             if gps_source:
                                 sync_doc["gps_source"] = gps_source
                                 sync_doc["last_fix"] = {
-                                    "at": incoming_fix_time,
+                                    "at": fix_ts,
                                     "lat": lat,
                                     "lon": lon,
                                     "gps_source": gps_source,
@@ -1890,6 +1890,37 @@ class FirestoreService:
                 )
         return synced_count
 
+    @staticmethod
+    def _devices_with_open_route_journeys() -> List[str]:
+        conn = sqlite3.connect(str(LOCAL_DB))
+        try:
+            return [
+                str(row[0]) for row in conn.execute(
+                    """
+                    SELECT DISTINCT device_id FROM journeys
+                    WHERE status IN ('ACTIVE', 'SCHEDULED', 'PAUSED')
+                      AND selected_route_id IS NOT NULL AND TRIM(selected_route_id) <> ''
+                    """
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            return []  # journeys table not initialised yet
+        finally:
+            conn.close()
+
+    def sync_route_journey_devices(self) -> None:
+        """Pull new Firestore GPS for devices that have an open approved-route journey."""
+        for device_id in self._devices_with_open_route_journeys():
+            try:
+                self._sync_firestore_telemetry_history(
+                    device_id, 200, min_interval_seconds=self.ROUTE_JOURNEY_SYNC_INTERVAL_SECONDS
+                )
+            except Exception as exc:
+                app_logger.warning(
+                    "Route journey GPS sync failed device=%s exception_type=%s",
+                    device_id, type(exc).__name__
+                )
+
     def _firestore_sync_worker(self):
         while not self._sync_worker_stop.wait(2.0):
             try:
@@ -1898,6 +1929,13 @@ class FirestoreService:
             except Exception as exc:
                 app_logger.error(
                     "Firestore telemetry worker failed exception_type=%s",
+                    type(exc).__name__
+                )
+            try:
+                self.sync_route_journey_devices()
+            except Exception as exc:
+                app_logger.error(
+                    "Route journey sync worker failed exception_type=%s",
                     type(exc).__name__
                 )
 
@@ -2041,8 +2079,14 @@ class FirestoreService:
     def _history_record_event_time(record: Dict[str, Any]) -> Optional[datetime]:
         return parse_iso_timestamp(fix_event_timestamp(record))
 
-    def _sync_firestore_telemetry_history(self, device_id: str, limit: int) -> None:
+    def _sync_firestore_telemetry_history(
+        self, device_id: str, limit: int, min_interval_seconds: Optional[float] = None
+    ) -> None:
         """Incrementally import verified fixes from history, telemetry, and logs."""
+        sync_interval = (
+            self.HISTORY_SYNC_INTERVAL_SECONDS
+            if min_interval_seconds is None else float(min_interval_seconds)
+        )
         if not is_firebase_active():
             return
 
@@ -2100,7 +2144,7 @@ class FirestoreService:
                     finally:
                         conn.close()
 
-                    if state and (now - state[2] < self.HISTORY_SYNC_INTERVAL_SECONDS):
+                    if state and (now - state[2] < sync_interval):
                         continue
 
                     watermark, watermark_kind = (
@@ -2702,7 +2746,8 @@ class FirestoreService:
                 try:
                     db = get_firestore_client()
                     if db:
-                        db.collection("alerts").add(alert_data)
+                        doc_id = str(alert_data.get("alert_id") or alert_data.get("id") or f"alt_{alert_data.get('device_id')}_{alert_data.get('alert_type')}")
+                        db.collection("alerts").document(doc_id).set(alert_data, merge=True)
                 except Exception as e:
                     app_logger.error(f"Firestore save_alert error: {e}")
             threading.Thread(target=_bg_sync, daemon=True).start()
@@ -2905,12 +2950,18 @@ class FirestoreService:
         cur = conn.cursor()
         rows = cur.execute(
             "SELECT * FROM journeys WHERE device_id = ? ORDER BY julianday(start_time) DESC, created_at DESC LIMIT ?",
-            (device_id, limit)
+            (device_id, limit * 2)
         ).fetchall()
         conn.close()
         local_results = []
+        seen_start_times = set()
         for r in rows:
             d = dict(r)
+            st = d.get("start_time") or d.get("created_at")
+            if st and st in seen_start_times:
+                continue
+            if st:
+                seen_start_times.add(st)
             try:
                 d["route_coordinates"] = json.loads(d.get("route_coordinates_json") or "[]")
             except Exception:
@@ -2928,6 +2979,8 @@ class FirestoreService:
                     "timestamp": d.get("end_time")
                 }
             local_results.append(d)
+            if len(local_results) >= limit:
+                break
 
         if local_results:
             with self._journey_cache_lock:

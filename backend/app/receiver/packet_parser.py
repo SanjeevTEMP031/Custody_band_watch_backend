@@ -234,7 +234,7 @@ def parse_ud(
         # Process through GPS service and Device service
         processed_record = gps_service.process_location_record(record)
         gps_processing_succeeded = processed_record is record
-        device_service.update_position(
+        device_position_update_succeeded = bool(device_service.update_position(
             device_id=device_id,
             lat=record.get("latitude"),
             lon=record.get("longitude"),
@@ -249,8 +249,7 @@ def parse_ud(
             timestamp=record.get("timestamp"),
             gps_source=record.get("gps_source"),
             received_at=server_received_at
-        )
-        device_position_update_succeeded = True
+        ))
         _log_gps_diagnostic(
             "GPS processing device=%s command=%s status=%s coordinates_valid=%s "
             "gps_processing_succeeded=%s device_position_update_succeeded=%s",

@@ -289,7 +289,11 @@ def get_live_locations():
             location.get("gps_status", d.get("gps_status", "No Fix"))
             if location else d.get("gps_status", "No Fix")
         )
-        location_timestamp = location.get("timestamp") if location else None
+        location_timestamp = (
+            location.get("timestamp") if gps_valid and location
+            else last_known_location.get("timestamp") if last_known_location
+            else (location.get("timestamp") if location else None)
+        )
 
         point = {
             "id": dev_id,
@@ -438,8 +442,9 @@ def get_latest_location(device_id: str):
             else dev.get("last_valid_gps_time")
         ),
         "last_valid_gps_time": (
-            location.get("timestamp") if location and location.get("timestamp")
-            else dev.get("last_valid_gps_time")
+            location.get("timestamp") if gps_valid
+            else last_known_location.get("timestamp") if has_last_known_coordinates
+            else (location.get("timestamp") if location and location.get("timestamp") else dev.get("last_valid_gps_time"))
         ),
         "last_known_location": last_known_location,
         "latest": dev.get("latest") or {},

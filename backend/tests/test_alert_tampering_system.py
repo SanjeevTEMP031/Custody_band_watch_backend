@@ -50,7 +50,8 @@ def isolate_test_environment(monkeypatch, tmp_path):
     
     # Patch LOCAL_DB across all relevant services
     for mod in (alert_module, firestore_module, command_module, geofence_module, health_module, stats_module, account_module, auth_module):
-        monkeypatch.setattr(mod, "LOCAL_DB", test_db_path)
+        if hasattr(mod, "LOCAL_DB"):
+            monkeypatch.setattr(mod, "LOCAL_DB", test_db_path)
 
     # Patch is_firebase_active to False so tests never touch Firestore or outbox sync
     monkeypatch.setattr(fb_core, "is_firebase_active", lambda: False)

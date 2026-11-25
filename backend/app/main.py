@@ -49,6 +49,22 @@ async def lifespan(app: FastAPI):
     # 1. Initialize Firebase (Firestore & Auth)
     init_firebase()
 
+    # 1b. Initialize Geofencing Schema and Tables
+    try:
+        from .geofencing.models import init_geofence_database
+        init_geofence_database()
+        app_logger.info("Geofencing database tables and indexes initialized")
+    except Exception as e:
+        app_logger.warning(f"Geofencing database initialization note: {e}")
+
+    # 1c. Initialize Journey & Route Monitoring Schema and Tables
+    try:
+        from .journeys.models import init_journey_database
+        init_journey_database()
+        app_logger.info("Journey and route monitoring tables and indexes initialized")
+    except Exception as e:
+        app_logger.warning(f"Journey database initialization note: {e}")
+
     # 2. Seed Admin User (Aditya / awsdevopskumar2026@gmail.com)
     try:
         auth_service.seed_admin_account(

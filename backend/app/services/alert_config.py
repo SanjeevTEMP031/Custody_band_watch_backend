@@ -35,6 +35,8 @@ ALERT_SEVERITIES: Dict[str, str] = {
     "GPS_UNAVAILABLE": "HIGH",
     "VEHICLE_SEPARATION_ALERT": "HIGH",
     "ROUTE_DEVIATION_ALERT": "HIGH",
+    "GEOFENCE_BREACH": "HIGH",
+    "EXCLUSION_ZONE_BREACH": "HIGH",
     "FALL_ALERT": "HIGH",
     # MEDIUM
     "UNSCHEDULED_STOP_ALERT": "MEDIUM",
@@ -43,6 +45,7 @@ ALERT_SEVERITIES: Dict[str, str] = {
     # INFO
     "BRACELET_CONNECTED": "INFO",
     "WATCH_LOCKED": "INFO",
+    "GEOFENCE_ENTRY": "INFO",
 }
 
 ALERT_TITLES: Dict[str, str] = {
@@ -61,6 +64,9 @@ ALERT_TITLES: Dict[str, str] = {
     "GPS_UNAVAILABLE": "GPS Fix Unavailable",
     "VEHICLE_SEPARATION_ALERT": "Vehicle Separation Breach",
     "ROUTE_DEVIATION_ALERT": "Approved Route Deviation",
+    "GEOFENCE_BREACH": "Geofence Boundary Breach",
+    "EXCLUSION_ZONE_BREACH": "Exclusion Zone Breach",
+    "GEOFENCE_ENTRY": "Geofence Zone Entry",
     "UNSCHEDULED_STOP_ALERT": "Unscheduled Vehicle Stop",
     "LOW_BATTERY_ALERT": "Low Battery Warning",
     "WATCH_INACTIVE": "Prolonged Inactivity Detected",
@@ -76,5 +82,4 @@ LEGACY_ALERT_TYPE_MAP: Dict[str, str] = {
     "TAMPER": "TAMPER_ALERT",
     "LOW_BATTERY": "LOW_BATTERY_ALERT",
     "DEVICE_OFFLINE": "WATCH_OFFLINE",
-    "GEOFENCE_BREACH": "ROUTE_DEVIATION_ALERT",
 }

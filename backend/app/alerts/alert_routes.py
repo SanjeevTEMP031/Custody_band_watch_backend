@@ -135,9 +135,10 @@ def get_alerts_by_device(
 
 
 # -----------------------------------------------------------------------------
-# 5. WEBSOCKET LIVE STREAMING (WS /api/v1/alerts/live)
+# 5. WEBSOCKET LIVE STREAMING (WS /api/v1/alerts/live and WS /api/v1/alerts/ws)
 # -----------------------------------------------------------------------------
 @router.websocket("/live")
+@router.websocket("/ws")
 async def websocket_live_alerts(websocket: WebSocket):
     """
     Real-time WebSocket feed for new and updated alerts.
@@ -190,7 +191,8 @@ async def acknowledge_alert(
 ):
     """
     Acknowledge an incoming security alert.
-    Note: Acknowledgement does not automatically resolve an ongoing hardware alert.
+    Silences audible sirens (requires_alarm=False), marks status ACKNOWLEDGED,
+    and broadcasts state updates to monitoring dashboards.
     """
     notes = None
     try:
@@ -202,6 +204,35 @@ async def acknowledge_alert(
 
     officer_email = await get_user_identity(request)
     res = alert_service.acknowledge_alert(alert_id, acknowledged_by=officer_email, notes=notes)
+    if not res:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+    return res
+
+
+# -----------------------------------------------------------------------------
+# 7b. SILENCE ALERT (POST /api/v1/alerts/{alert_id}/silence)
+# -----------------------------------------------------------------------------
+@router.post("/{alert_id}/silence", response_model=Dict[str, Any])
+@router.put("/{alert_id}/silence", response_model=Dict[str, Any], include_in_schema=False)
+async def silence_alert(
+    alert_id: str,
+    request: Request
+):
+    """
+    Silence an active alert audible alarm.
+    Sets requires_alarm=false while retaining the alert in history,
+    and broadcasts ALERT_SILENCED to stop sirens across all open dashboards.
+    """
+    notes = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            notes = body.get("notes") or body.get("reason")
+    except Exception:
+        pass
+
+    officer_email = await get_user_identity(request)
+    res = alert_service.silence_alert(alert_id, silenced_by=officer_email, notes=notes)
     if not res:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
     return res
@@ -250,6 +281,25 @@ async def acknowledge_alert_body(request: Request):
     notes = body.get("notes") or body.get("resolution_notes")
     officer_email = await get_user_identity(request)
     res = alert_service.acknowledge_alert(alert_id, acknowledged_by=officer_email, notes=notes)
+    if not res:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+    return res
+
+
+@router.post("/silence", response_model=Dict[str, Any])
+async def silence_alert_body(request: Request):
+    """Silence alert with alert ID passed in body or query."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    alert_id = body.get("id") or body.get("alert_id") or request.query_params.get("id") or request.query_params.get("alert_id")
+    if not alert_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing alert id")
+    notes = body.get("notes") or body.get("reason")
+    officer_email = await get_user_identity(request)
+    res = alert_service.silence_alert(alert_id, silenced_by=officer_email, notes=notes)
     if not res:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
     return res
